@@ -1,0 +1,30 @@
+# Runs the Rust tests on every OS. The golden trace hashes in the simulator tests are the
+# cross-OS determinism check: the same seed must give the same run on Linux, macOS and Windows.
+# Not run yet: this file was written without being able to run it (no push happened).
+name: ci
+on: [push, pull_request]
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain (pinned by rust-toolchain.toml)
+        run: rustup show
+      - run: cargo test --workspace --no-fail-fast
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo install cargo-fuzz --locked
+      - name: one minute per target
+        working-directory: fuzz
+        run: |
+          for t in parse_datagram recv_window ack_frame handshake_flood conn_stream; do
+            cargo +nightly fuzz run "$t" -- -max_total_time=60
+          done
