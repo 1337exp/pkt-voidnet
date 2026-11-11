@@ -1,4 +1,5 @@
-//! pkt-voidnet core, stage 1: wire format, packet number window, acknowledgements.
+//! pkt-voidnet core, stages 1-2: wire format, packet number window, acknowledgements,
+//! handshake and admission (server and client state machines).
 //!
 //! Sans-IO, `no_std`, no allocation, no `unsafe`. The normative description of every
 //! byte is `docs/wire.md`; this crate must match it.
@@ -20,13 +21,25 @@
 extern crate std;
 
 pub mod ack;
+pub mod addr;
+pub mod client;
+pub mod config;
 pub mod dump;
 pub mod io;
+pub mod limit;
+pub mod ring;
+pub mod server;
+pub mod session;
+pub mod siphash;
 pub mod varint;
 pub mod window;
 pub mod wire;
 
 pub use ack::AckFrame;
+pub use addr::Addr;
+pub use client::{Client, ClientEvent, Failed};
+pub use config::{Blob, ChannelTable, ClientConfig, ServerConfig};
+pub use server::{Closed, ConnId, Event, Server};
 pub use wire::{
     ChannelMode, DataDatagram, DataWriter, Datagram, Frame, HelloFields, ParseError, WriteError,
 };

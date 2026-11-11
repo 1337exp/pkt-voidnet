@@ -43,6 +43,21 @@ pub mod tag {
     pub const DISCONNECT: u8 = 0x12;
 }
 
+/// REJECT codes. Values above these are application-defined.
+/// Коды REJECT. Значения выше определяет приложение.
+pub mod reject_code {
+    /// Wire version, protocol id or app version not accepted.
+    pub const VERSION: u8 = 1;
+    /// Channel table or datagram size differs.
+    pub const CONFIG: u8 = 2;
+    /// No free connection slot.
+    pub const FULL: u8 = 3;
+    /// Too many requests.
+    pub const RATE_LIMITED: u8 = 4;
+    /// Too many connections from this source.
+    pub const SOURCE_LIMIT: u8 = 5;
+}
+
 /// Delivery mode of a channel. / Режим доставки канала.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChannelMode {
@@ -105,6 +120,15 @@ impl HelloFields {
             client_random: r.u64()?,
             caps: r.u32()?,
         })
+    }
+
+    /// The 29 bytes of HELLO FIELDS. / Те самые 29 байт HELLO FIELDS.
+    pub fn to_bytes(&self) -> [u8; HELLO_FIELDS_LEN] {
+        let mut out = [0u8; HELLO_FIELDS_LEN];
+        let mut w = Writer::new(&mut out, HELLO_FIELDS_LEN);
+        // exactly 29 bytes fit, the write cannot fail
+        let _ = self.write(&mut w);
+        out
     }
 
     fn write(&self, w: &mut Writer<'_>) -> Result<(), WriteError> {

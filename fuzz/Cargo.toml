@@ -33,3 +33,10 @@ path = "fuzz_targets/ack_frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "handshake_flood"
+path = "fuzz_targets/handshake_flood.rs"
+test = false
+doc = false
+bench = false

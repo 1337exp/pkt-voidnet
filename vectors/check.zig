@@ -231,3 +231,53 @@ test "every vector decodes to the listed description" {
     try std.testing.expect(checked >= 50);
     try std.testing.expectEqual(@as(usize, 0), failures);
 }
+
+// ---------------------------------------------------------------- config_hash (docs/wire.md, section 3)
+
+const cfg_vectors = @embedFile("config-hash-v1.txt");
+
+// low 32 bits of SipHash-1-3 over [count] ++ [mode...] ++ [max_datagram as u16 LE],
+// key = "voidnet-cfg-v1" and two zero bytes
+fn configHash(modes: []const u8, dgram: u16) u32 {
+    const Sip = std.crypto.auth.siphash.SipHash64(1, 3);
+    const key = "voidnet-cfg-v1\x00\x00";
+    var msg: [1 + 16 + 2]u8 = undefined;
+    msg[0] = @intCast(modes.len);
+    @memcpy(msg[1 .. 1 + modes.len], modes);
+    std.mem.writeInt(u16, msg[1 + modes.len ..][0..2], dgram, .little);
+    var mac = Sip.init(key);
+    mac.update(msg[0 .. 3 + modes.len]);
+    return @truncate(mac.finalInt());
+}
+
+test "config_hash vectors" {
+    var failures: usize = 0;
+    var checked: usize = 0;
+    var lines = std.mem.splitScalar(u8, cfg_vectors, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const name = fields.next() orelse return error.BadVectorLine;
+        const modes_text = fields.next() orelse return error.BadVectorLine;
+        const md_text = fields.next() orelse return error.BadVectorLine;
+        const want = fields.next() orelse return error.BadVectorLine;
+
+        var modes: [16]u8 = undefined;
+        var n: usize = 0;
+        if (!std.mem.eql(u8, modes_text, "-")) {
+            var it = std.mem.splitScalar(u8, modes_text, ',');
+            while (it.next()) |m| : (n += 1) modes[n] = try std.fmt.parseInt(u8, m, 10);
+        }
+        const md = try std.fmt.parseInt(u16, md_text, 10);
+        var got: [8]u8 = undefined;
+        _ = try std.fmt.bufPrint(&got, "{x:0>8}", .{configHash(modes[0..n], md)});
+        checked += 1;
+        if (!std.mem.eql(u8, &got, want)) {
+            failures += 1;
+            std.debug.print("MISMATCH {s}: expected {s} got {s}\n", .{ name, want, got });
+        }
+    }
+    try std.testing.expect(checked >= 8);
+    try std.testing.expectEqual(@as(usize, 0), failures);
+}

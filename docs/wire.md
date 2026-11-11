@@ -4,7 +4,7 @@
 
 This file is the single source of truth for the bytes on the wire. Anyone can implement a client, a bot or a tool from this page and the vectors in `vectors/wire-v1.txt`; there is no other normative source. Where the Rust code and this file disagree, the file wins and the code is a bug.
 
-Status: **draft**. Layouts in sections 1-4 are fixed for stage 1 and covered by vectors. Sections 5-6 (derivations, handshake rules) are provisional until stage 2.
+Status: **draft**. Layouts in sections 1-4 and `config_hash` (section 5) are fixed and covered by vectors. The handshake rules in section 6 are implemented and tested on the simulator (stage 2).
 
 ## 0. Conventions
 
@@ -123,7 +123,7 @@ wire_version:u8 | protocol_id:u64 | app_version:u32 | config_hash:u32 | client_r
 | `wire_version` | `1` for this document. For any other value the remaining fields are undefined and the server answers REJECT. |
 | `protocol_id` | the application's wire gate; a mismatch is rejected |
 | `app_version` | application version; the application decides compatibility |
-| `config_hash` | hash of the wire-relevant configuration (channel table, datagram size); a mismatch is rejected |
+| `config_hash` | hash of the wire-relevant configuration, defined in section 5; a mismatch is rejected |
 | `client_random` | 8 fresh random bytes per connection attempt |
 | `caps` | capability bits; none are defined in v1, send 0, ignore unknown bits |
 
@@ -140,7 +140,7 @@ REJECT     84 | code:u8 | echo:u64                                       (10 byt
 - `echo`: the client's `client_random`. A client accepts ACCEPT or REJECT only if `echo` matches the value it sent; this stops an off-path attacker from forging them.
 - `token`: the session token (section 5).
 - `blob`: up to 32 bytes of application data from server to client (for example game parameters); `blob_len <= 32`.
-- `code` in REJECT: `1` version, `2` config mismatch, `3` server full, `4` rate limited. Other values are application-defined.
+- `code` in REJECT: `1` version (wire version, protocol id or app version), `2` config mismatch, `3` server full, `4` rate limited, `5` too many connections from this source. Other values are application-defined.
 
 ## 4. Sizes
 
@@ -153,26 +153,44 @@ REJECT     84 | code:u8 | echo:u64                                       (10 byt
 
 The shortest DATA datagram is 12 bytes (a PING).
 
-## 5. Derivations (provisional, stage 2)
+## 5. Derived values
 
-- `cookie = SipHash-1-3(key = current secret, DOMAIN_COOKIE | addr | coarse | HELLO FIELDS)`, 64 bits. The secret rotates and the previous one is also accepted. A cookie is valid if `coarse` is within 5 seconds of the server clock.
-- `token = SipHash-1-3(key = token key, DOMAIN_TOKEN | addr | client_random | connection counter)`, with a key different from the cookie secret.
-- `addr` is the opaque address bytes the host gives the core (at most 20 bytes).
+**`config_hash`** is the only derived value two implementations must compute identically. It is the low 32 bits of SipHash-1-3 (64-bit output) with the key `"voidnet-cfg-v1"` followed by two zero bytes, over:
 
-## 6. Handshake flow and rules (provisional, stage 2)
+```
+count:u8 | mode:u8 x count | max_datagram:u16
+```
+
+where `mode` is the numeric value from the channel mode table in section 2.3 and `max_datagram` is the configured datagram size, little-endian. `vectors/config-hash-v1.txt` lists cases.
+
+**Cookie and token are private to the server.** The client never computes or checks them, so they are not part of the wire format. An implementation must only guarantee these properties:
+
+- A cookie is a 64-bit tag that can be verified without stored state and depends on the source address (all address bytes including the port), `coarse`, and every field of HELLO FIELDS, under a secret the server rotates. A previous secret is also accepted for one period. A cookie is valid if `coarse` is within 5 seconds of the server clock (configurable).
+- A token is 64 bits, unpredictable to anyone without the server's key, and different for every connection.
+- Comparisons of cookies and tokens take constant time.
+
+The reference implementation uses SipHash-1-3 for both (`crates/voidnet-core/src/server.rs`).
+
+## 6. Handshake flow and rules
 
 ```
 client                         server
   HELLO  ------------------->            no state stored
          <------------------  CHALLENGE   (or REJECT)
-  RESPONSE ------------------>            verifies the cookie, allocates the slot
+  RESPONSE ------------------>            verifies the cookie, takes a slot (pending)
          <------------------  ACCEPT      (or REJECT)
+  DATA (ping) --------------->            first authentic DATA: connection confirmed
+         <------------------  DATA (ping)
   DATA ...  <------------->  DATA ...
 ```
 
-- No server state exists before a valid cookie. A rate limit applies per source and globally.
-- A valid RESPONSE from an address that already has a live connection: if `client_random` is the same, ACCEPT is repeated (idempotent); if it differs, the old connection is closed and replaced.
-- Idle timeout, keep-alive interval and handshake timeout are host configuration, not wire values.
+- **No server state before a valid cookie.** A RESPONSE takes a slot, but the host is told about the connection only when the client's first authentic DATA arrives (confirmed). A pending connection that is never confirmed is dropped silently after a timeout (default 5 s). This keeps clients that never completed the handshake invisible to the application and short-lived in the table.
+- **Confirmation.** After ACCEPT the client sends a PING in a DATA datagram, and repeats it every retry interval until it receives any authentic DATA from the server. The server answers PING with a PING for the first few times it sees one (default 8), which confirms the path both ways. Later stages replace this with acknowledgements.
+- **Limits at the server.** Per-source token bucket for HELLO, then a global bucket for HELLO (the per-source one goes first so one address cannot drain the global one), a cap on connections per source, a cap on all connections. A refused request gets REJECT only when that is cheap and safe (version, config, full, source limit); rate-limited requests get no reply.
+- **Same address connects again:** a valid RESPONSE with the same `client_random` repeats ACCEPT with the same token (idempotent, covers a lost ACCEPT); with a different `client_random` the old connection is closed (the host sees it as replaced) and a new one is created.
+- **Client retries.** HELLO or RESPONSE is resent every retry interval (default 500 ms). After a few RESPONSE resends without an answer (default 4) the client starts over with a new HELLO, which recovers from a forged or stale CHALLENGE. The whole attempt times out after the handshake timeout (default 10 s).
+- **Idle timeout** (default 30 s of no authentic datagram) ends a connection on either side. Keep-alive arrives with stage 3.
+- Timeouts, intervals and limits are host configuration, not wire values.
 
 ## 7. Versioning
 
