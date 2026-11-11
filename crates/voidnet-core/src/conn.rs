@@ -152,6 +152,7 @@ pub struct ConnStats {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 enum Slot {
     Free,
     /// Waiting to be (re)sent. / Ждёт (пере)отправки.
@@ -209,7 +210,8 @@ struct RelRx {
 #[derive(Clone, Copy)]
 struct UMsg {
     ch: u8,
-    mseq: Option<u16>,
+    has_mseq: bool,
+    mseq: u16,
     len: u16,
     data: [u8; MSG_MAX],
 }
@@ -218,7 +220,8 @@ impl Default for UMsg {
     fn default() -> Self {
         Self {
             ch: 0,
-            mseq: None,
+            has_mseq: false,
+            mseq: 0,
             len: 0,
             data: [0; MSG_MAX],
         }
@@ -226,6 +229,7 @@ impl Default for UMsg {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 enum Pkt {
     Pending,
     Acked,
@@ -280,7 +284,8 @@ pub struct Conn {
     sent: [Sent; SENT_CAP],
     sent_head: usize,
     sent_len: usize,
-    largest_acked: Option<u64>,
+    largest_acked: u64,
+    has_largest: bool,
 
     // timing
     srtt_us: u64,
@@ -319,9 +324,9 @@ impl Conn {
                 n += 1;
             }
         }
-        Self {
+        let mut c = Self {
             cfg,
-            token,
+            token: 0,
             win: RecvWindow::new(),
             tx_pn: 0,
             last_recv_us: now_us,
@@ -334,7 +339,8 @@ impl Conn {
             sent: [Sent::empty(); SENT_CAP],
             sent_head: 0,
             sent_len: 0,
-            largest_acked: None,
+            largest_acked: 0,
+            has_largest: false,
             srtt_us: cfg.initial_rtt_us,
             rttvar_us: cfg.initial_rtt_us / 2,
             min_rtt_us: 0,
@@ -365,7 +371,82 @@ impl Conn {
             uq: Ring::new(),
             delivery: Ring::new(),
             stats: ConnStats::default(),
+        };
+        c.reset(token, cfg, now_us);
+        c
+    }
+
+    /// Put the connection into the state [`new`](Self::new) builds, writing only the fields that
+    /// carry state. The message buffers keep whatever bytes they hold: they are always written
+    /// before they are read. This lets the host give the library zeroed memory of the right size
+    /// and have the connection initialised in place, without building a 100 KB value on the stack.
+    /// Привести соединение в состояние, которое строит `new`, записывая только поля состояния.
+    /// Буферы сообщений остаются как были: их всегда пишут до чтения. Так хозяин может отдать
+    /// обнулённую память и получить инициализацию на месте, без значения в 100 КБ на стеке.
+    pub fn reset(&mut self, token: u64, cfg: ConnConfig, now_us: u64) {
+        self.cfg = cfg;
+        self.token = token;
+        self.win = RecvWindow::new();
+        self.tx_pn = 0;
+        self.last_recv_us = now_us;
+        self.last_send_us = now_us;
+        self.largest_recv_us = now_us;
+        self.ack_owed = false;
+        self.ack_now = false;
+        self.ack_since_us = 0;
+        self.eliciting_unacked = 0;
+        for s in &mut self.sent {
+            s.state = Pkt::Acked;
+            s.nrefs = 0;
         }
+        self.sent_head = 0;
+        self.sent_len = 0;
+        self.largest_acked = 0;
+        self.has_largest = false;
+        self.srtt_us = cfg.initial_rtt_us;
+        self.rttvar_us = cfg.initial_rtt_us / 2;
+        self.min_rtt_us = 0;
+        self.latest_rtt_us = 0;
+        self.have_rtt = false;
+        self.pto_count = 0;
+        self.probe = 0;
+        self.ping_requested = false;
+        self.rel_of = [u8::MAX; MAX_CHANNELS];
+        self.rel_ch = [u8::MAX; MAX_RELIABLE_CHANNELS];
+        let mut n = 0usize;
+        for (i, m) in cfg.channels.as_slice().iter().enumerate() {
+            if *m == ChannelMode::ReliableOrdered {
+                if let (Some(r), Some(c)) = (self.rel_of.get_mut(i), self.rel_ch.get_mut(n)) {
+                    *r = n as u8;
+                    *c = i as u8;
+                }
+                n += 1;
+            }
+        }
+        for tx in &mut self.rel_tx {
+            tx.base = 0;
+            tx.next = 0;
+            for s in &mut tx.slots {
+                s.state = Slot::Free;
+                s.mseq = 0;
+                s.len = 0;
+                s.sent_once = false;
+            }
+        }
+        for rx in &mut self.rel_rx {
+            rx.next = 0;
+            for s in &mut rx.slots {
+                s.used = false;
+                s.mseq = 0;
+                s.len = 0;
+            }
+        }
+        self.seq_tx = [0; MAX_CHANNELS];
+        self.seq_rx = [0; MAX_CHANNELS];
+        self.seq_seen = [false; MAX_CHANNELS];
+        self.uq.reset();
+        self.delivery.reset();
+        self.stats = ConnStats::default();
     }
 
     pub fn stats(&self) -> ConnStats {
@@ -383,6 +464,10 @@ impl Conn {
         let pn = self.tx_pn;
         self.tx_pn = self.tx_pn.wrapping_add(1);
         pn
+    }
+
+    fn largest(&self) -> Option<u64> {
+        self.has_largest.then_some(self.largest_acked)
     }
 
     fn mode(&self, ch: u8) -> Option<ChannelMode> {
@@ -442,7 +527,8 @@ impl Conn {
                 };
                 let mut m = UMsg {
                     ch,
-                    mseq,
+                    has_mseq: mseq.is_some(),
+                    mseq: mseq.unwrap_or(0),
                     len,
                     data: [0; MSG_MAX],
                 };
@@ -565,7 +651,7 @@ impl Conn {
             t = t.min(p.time_us.saturating_add(self.pto_us() << backoff));
         }
         // a pending packet older than the largest acknowledged one is lost by time
-        if let Some(la) = self.largest_acked {
+        if let Some(la) = self.largest() {
             let ld = self.loss_delay_us();
             for s in (0..self.sent_len).filter_map(|i| self.sent_at(i)) {
                 if s.state == Pkt::Pending && s.pn < la {
@@ -609,7 +695,7 @@ impl Conn {
     }
 
     fn detect_loss(&mut self, now_us: u64) {
-        let Some(la) = self.largest_acked else { return };
+        let Some(la) = self.largest() else { return };
         let ld = self.loss_delay_us();
         for i in 0..self.sent_len {
             let Some(s) = self.sent_at(i) else { break };
@@ -639,7 +725,12 @@ impl Conn {
         let Some(ranges) = a.ranges(largest) else {
             return;
         };
-        self.largest_acked = Some(self.largest_acked.map_or(largest, |l| l.max(largest)));
+        self.largest_acked = if self.has_largest {
+            self.largest_acked.max(largest)
+        } else {
+            largest
+        };
+        self.has_largest = true;
         let mut ranges_buf = [(0u64, 0u64); 16];
         let mut nr = 0;
         for r in ranges {
@@ -896,7 +987,7 @@ impl Conn {
             return None;
         }
         // never run 2^15 packet numbers ahead of what the peer has confirmed
-        if self.tx_pn.saturating_sub(self.largest_acked.unwrap_or(0)) >= MAX_RUNAHEAD {
+        if self.tx_pn.saturating_sub(self.largest_acked) >= MAX_RUNAHEAD {
             return None;
         }
         let channels = self.cfg.channels;
@@ -958,7 +1049,7 @@ impl Conn {
 
         while let Some(u) = self.uq.peek() {
             let payload = u.data.get(..usize::from(u.len)).unwrap_or(&[]);
-            if w.msg(u.ch, u.mseq, payload).is_err() {
+            if w.msg(u.ch, u.has_mseq.then_some(u.mseq), payload).is_err() {
                 break;
             }
             messages += 1;

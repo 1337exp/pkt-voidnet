@@ -63,6 +63,13 @@ impl<const R: usize> RateTable<R> {
         }
     }
 
+    /// Forget every source. / Забыть все источники.
+    pub fn reset(&mut self) {
+        for e in &mut self.entries {
+            *e = Entry::default();
+        }
+    }
+
     pub fn allow(&mut self, key: u64, now_us: u64, rate_per_s: u32, burst: u32) -> bool {
         if rate_per_s == 0 {
             return true;

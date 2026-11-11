@@ -15,6 +15,7 @@ use crate::wire::{
 
 /// Why a connection attempt failed. / Почему попытка соединения не удалась.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum Failed {
     /// The server answered REJECT with this code (see `wire::reject_code`).
     Rejected(u8),
@@ -24,6 +25,7 @@ pub enum Failed {
 
 /// What the host learns about the connection. / Что узнаёт хозяин о соединении.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum ClientEvent {
     /// The server accepted; `blob` is its application data from ACCEPT.
     Connected {
@@ -41,6 +43,7 @@ impl Default for ClientEvent {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 enum State {
     Idle,
     Hello,
@@ -50,6 +53,7 @@ enum State {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(u8)]
 enum Out {
     #[default]
     Hello,
@@ -95,6 +99,26 @@ impl Client {
             out: Ring::new(),
             events: Ring::new(),
         })
+    }
+
+    /// Put the client into the state [`new`](Self::new) builds, in place (see `Server::reset`).
+    /// Привести клиента в состояние `new` на месте (см. `Server::reset`).
+    pub fn reset(&mut self, cfg: ClientConfig) -> Result<(), ConfigError> {
+        cfg.validate()?;
+        self.cfg = cfg;
+        self.state = State::Idle;
+        self.server = Addr::default();
+        self.random = 0;
+        self.started_us = 0;
+        self.last_tx_us = 0;
+        self.coarse = 0;
+        self.cookie = 0;
+        self.response_sends = 0;
+        self.conn.reset(0, cfg.conn_config(), 0);
+        self.server_seen = false;
+        self.out.reset();
+        self.events.reset();
+        Ok(())
     }
 
     /// Begin a connection attempt. `random` must be 8 fresh random bytes from the host.

@@ -60,6 +60,7 @@ pub mod reject_code {
 
 /// Delivery mode of a channel. / Режим доставки канала.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum ChannelMode {
     Unreliable = 0,
     UnreliableSequenced = 1,

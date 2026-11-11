@@ -24,6 +24,13 @@ impl<T: Copy + Default, const CAP: usize> Ring<T, CAP> {
         }
     }
 
+    /// Empty the ring without touching the items (they are overwritten before they are read).
+    /// Опустошить кольцо, не трогая элементы (их перезаписывают до чтения).
+    pub fn reset(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

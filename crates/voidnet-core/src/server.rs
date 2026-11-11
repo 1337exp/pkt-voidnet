@@ -36,6 +36,7 @@ pub struct ConnId {
 
 /// Why a connection ended. / Почему соединение закончилось.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum Closed {
     /// The host closed it, with this reason code.
     Local(u8),
@@ -50,6 +51,7 @@ pub enum Closed {
 /// What the host learns. Events are never overwritten or dropped.
 /// Что узнаёт хозяин. События не затираются и не теряются.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum Event {
     Connected { conn: ConnId, addr: Addr },
     Disconnected { conn: ConnId, reason: Closed },
@@ -65,6 +67,7 @@ impl Default for Event {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[repr(u8)]
 enum Body {
     Challenge { coarse: u32, cookie: u64 },
     Accept { token: u64, echo: u64 },
@@ -216,6 +219,51 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
             events: Ring::new(),
             stats: ServerStats::default(),
         })
+    }
+
+    /// Put the server into the state [`new`](Self::new) builds, in place: only the fields that
+    /// carry state are written, so the host can give zeroed memory and no large value is built on
+    /// the stack. On an error nothing is changed.
+    /// Привести сервер в состояние `new` на месте: пишутся только поля состояния, поэтому хозяин
+    /// может отдать обнулённую память, а большое значение на стеке не строится.
+    pub fn reset(
+        &mut self,
+        cfg: ServerConfig,
+        seed: [u8; 32],
+        now_us: u64,
+    ) -> Result<(), ConfigError> {
+        cfg.validate()?;
+        let (a, b) = seed.split_at(16);
+        self.secret.copy_from_slice(a);
+        self.prev_secret.copy_from_slice(a);
+        self.token_key.copy_from_slice(b);
+        let h0 = siphash13(&self.token_key, b"voidnet addr hash 0");
+        let h1 = siphash13(&self.secret, b"voidnet addr hash 1");
+        self.hash_key[..8].copy_from_slice(&h0.to_le_bytes());
+        self.hash_key[8..].copy_from_slice(&h1.to_le_bytes());
+        self.cfg = cfg;
+        self.has_prev = false;
+        self.next_rotation_us = now_us.saturating_add(cfg.rotation_interval_us);
+        self.conn_counter = 0;
+        self.rr = 0;
+        self.limiter.reset();
+        self.global = Bucket::default();
+        let conn_cfg = cfg.conn_config();
+        for s in &mut self.slots {
+            s.used = false;
+            s.confirmed = false;
+            s.generation = 0;
+            s.addr = Addr::default();
+            s.addr_hash = 0;
+            s.client_random = 0;
+            s.created_us = 0;
+            s.conn.reset(0, conn_cfg, 0);
+        }
+        self.used = 0;
+        self.replies.reset();
+        self.events.reset();
+        self.stats = ServerStats::default();
+        Ok(())
     }
 
     pub fn stats(&self) -> &ServerStats {

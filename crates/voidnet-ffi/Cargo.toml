@@ -11,6 +11,8 @@ crate-type = ["staticlib", "rlib"]
 
 [features]
 abi = []
+# a small profile (4 slots) so that tests, Miri and the fuzzers stay light
+small = []
 
 [dependencies]
 voidnet-core = { path = "../voidnet-core" }

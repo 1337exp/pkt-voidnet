@@ -13,6 +13,16 @@ pub struct ChannelTable {
     modes: [ChannelMode; MAX_CHANNELS],
 }
 
+impl Default for ChannelTable {
+    /// No channels. / Без каналов.
+    fn default() -> Self {
+        Self {
+            count: 0,
+            modes: [ChannelMode::Unreliable; MAX_CHANNELS],
+        }
+    }
+}
+
 impl ChannelTable {
     /// `None` if there are more than [`MAX_CHANNELS`] modes. / `None`, если режимов больше 16.
     pub fn new(modes: &[ChannelMode]) -> Option<Self> {
