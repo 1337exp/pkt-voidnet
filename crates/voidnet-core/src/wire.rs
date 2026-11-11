@@ -200,6 +200,12 @@ pub struct DataDatagram<'a> {
 }
 
 impl<'a> DataDatagram<'a> {
+    /// Size of the whole datagram on the wire, header included.
+    /// Размер всей датаграммы на проводе, с заголовком.
+    pub fn wire_len(&self) -> usize {
+        DATA_HEADER_LEN + self.body.len()
+    }
+
     /// Iterate over the frames. Validation already happened in [`parse`].
     /// Обход кадров. Проверка уже выполнена в [`parse`].
     pub fn frames(&self) -> Frames<'a> {

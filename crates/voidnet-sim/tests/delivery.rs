@@ -465,6 +465,24 @@ fn steady_game_traffic_needs_almost_no_ack_only_datagrams() {
 }
 
 #[test]
+fn received_bytes_match_sent_bytes_on_a_clean_link() {
+    let mut p = Pair::new(cfg(), clean(25_000), 14);
+    let mut rng = Pcg32::new(14, 14);
+    for i in 0..200u32 {
+        p.a.conn.send(UNRELIABLE, &body(i, &mut rng)).unwrap();
+        p.b.conn.send(UNRELIABLE, &body(i, &mut rng)).unwrap();
+        p.run_for(20_000);
+        while p.a.conn.poll_recv().is_some() {}
+        while p.b.conn.poll_recv().is_some() {}
+    }
+    p.run_for(200_000); // let the last datagrams land
+    let (a, b) = (p.a.conn.stats(), p.b.conn.stats());
+    assert!(a.bytes_sent > 0 && b.bytes_sent > 0);
+    assert_eq!(a.bytes_sent, b.bytes_recv, "a to b");
+    assert_eq!(b.bytes_sent, a.bytes_recv, "b to a");
+}
+
+#[test]
 fn an_idle_connection_keeps_itself_alive_and_measured() {
     let mut p = Pair::new(cfg(), clean(30_000), 13);
     p.run_for(10_000_000);

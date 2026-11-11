@@ -812,6 +812,7 @@ impl Conn {
         }
         self.win.mark(pn);
         self.stats.packets_recv += 1;
+        self.stats.bytes_recv += dd.wire_len() as u64;
         self.last_recv_us = self.last_recv_us.max(now_us);
         if self.win.largest() == Some(pn) {
             self.largest_recv_us = now_us;
