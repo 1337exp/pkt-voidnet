@@ -6,3 +6,8 @@ zig-out/
 *.pdb
 *.a
 *.lib
+
+# spike results: extra build outputs
+zig-out*/
+fuzz/artifacts/
+fuzz/corpus/

@@ -1,0 +1,10 @@
+[package]
+name = "voidnet-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "pkt-voidnet deterministic network simulator and test harness (std)"
+
+[dependencies]
+voidnet-core = { path = "../voidnet-core" }

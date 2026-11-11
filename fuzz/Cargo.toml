@@ -1,0 +1,35 @@
+[package]
+name = "voidnet-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+voidnet-core = { path = "../crates/voidnet-core" }
+
+[workspace]
+
+[[bin]]
+name = "parse_datagram"
+path = "fuzz_targets/parse_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recv_window"
+path = "fuzz_targets/recv_window.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ack_frame"
+path = "fuzz_targets/ack_frame.rs"
+test = false
+doc = false
+bench = false

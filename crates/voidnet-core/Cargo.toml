@@ -1,0 +1,9 @@
+[package]
+name = "voidnet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "pkt-voidnet core: wire format, packet number window, acknowledgements (sans-IO, no_std, no alloc)"
+
+[dependencies]

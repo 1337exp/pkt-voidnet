@@ -1,0 +1,16 @@
+[package]
+name = "voidnet-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "pkt-voidnet C ABI (stage 1: version only)"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+abi = []
+
+[dependencies]
+voidnet-core = { path = "../voidnet-core" }
