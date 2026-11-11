@@ -1,0 +1,8 @@
+.claude/
+target/
+zig-out/
+.zig-cache/
+*.exe
+*.pdb
+*.a
+*.lib
