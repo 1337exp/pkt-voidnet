@@ -5,10 +5,10 @@
 //! рукопожатия и подтверждением соединения первой DATA.
 
 use crate::addr::Addr;
-use crate::config::{Blob, ClientConfig};
+use crate::config::{Blob, ClientConfig, ConfigError};
+use crate::conn::{Conn, ConnStats, SendError, MSG_MAX};
 use crate::ring::Ring;
 use crate::server::Closed;
-use crate::session::Peer;
 use crate::wire::{
     self, DataWriter, Datagram, HelloFields, WriteError, MAX_DATAGRAM, WIRE_VERSION,
 };
@@ -54,9 +54,6 @@ enum Out {
     #[default]
     Hello,
     Response,
-    Ping {
-        pn: u64,
-    },
     Disconnect {
         pn: u64,
         reason: u8,
@@ -74,15 +71,16 @@ pub struct Client {
     coarse: u32,
     cookie: u64,
     response_sends: u8,
-    peer: Peer,
+    conn: Conn,
     server_seen: bool,
     out: Ring<Out, 8>,
     events: Ring<ClientEvent, 8>,
 }
 
 impl Client {
-    pub fn new(cfg: ClientConfig) -> Self {
-        Self {
+    pub fn new(cfg: ClientConfig) -> Result<Self, ConfigError> {
+        cfg.validate()?;
+        Ok(Self {
             cfg,
             state: State::Idle,
             server: Addr::default(),
@@ -92,11 +90,11 @@ impl Client {
             coarse: 0,
             cookie: 0,
             response_sends: 0,
-            peer: Peer::new(0, 0),
+            conn: Conn::new(0, cfg.conn_config(), 0),
             server_seen: false,
             out: Ring::new(),
             events: Ring::new(),
-        }
+        })
     }
 
     /// Begin a connection attempt. `random` must be 8 fresh random bytes from the host.
@@ -170,13 +168,12 @@ impl Client {
                 blob,
             } if echo == self.random && matches!(self.state, State::Hello | State::Responding) => {
                 self.state = State::Connected;
-                self.peer = Peer::new(token, now_us);
+                self.conn = Conn::new(token, self.cfg.conn_config(), now_us);
                 self.last_tx_us = now_us;
                 let blob = Blob::new(blob).unwrap_or_default();
                 self.events.push(ClientEvent::Connected { blob, caps });
                 // the first authentic DATA confirms the connection to the server
-                let pn = self.peer.next_pn();
-                self.out.push(Out::Ping { pn });
+                self.conn.queue_ping();
             }
             Datagram::Reject { code, echo }
                 if echo == self.random
@@ -185,7 +182,7 @@ impl Client {
                 self.fail(Failed::Rejected(code));
             }
             Datagram::Data(dd) if self.state == State::Connected => {
-                if let Ok(acc) = self.peer.receive(&dd, now_us) {
+                if let Ok(acc) = self.conn.on_datagram(&dd, now_us) {
                     self.server_seen = true;
                     if let Some(reason) = acc.disconnect {
                         self.state = State::Closed;
@@ -202,7 +199,7 @@ impl Client {
     pub fn disconnect(&mut self, reason: u8) {
         if self.state == State::Connected {
             for _ in 0..3 {
-                let pn = self.peer.next_pn();
+                let pn = self.conn.next_pn();
                 self.out.push(Out::Disconnect { pn, reason });
             }
             self.events
@@ -238,19 +235,16 @@ impl Client {
                 }
             }
             State::Connected => {
-                if !self.server_seen {
-                    if waited >= self.cfg.handshake_timeout_us {
-                        self.state = State::Closed;
-                        self.events.push(ClientEvent::Failed(Failed::Timeout));
-                    } else if since_tx >= self.cfg.retry_interval_us {
-                        self.last_tx_us = now_us;
-                        let pn = self.peer.next_pn();
-                        self.out.push(Out::Ping { pn });
-                    }
-                } else if now_us.saturating_sub(self.peer.last_recv_us) >= self.cfg.idle_timeout_us
+                if !self.server_seen && waited >= self.cfg.handshake_timeout_us {
+                    self.state = State::Closed;
+                    self.events.push(ClientEvent::Failed(Failed::Timeout));
+                } else if self.server_seen
+                    && now_us.saturating_sub(self.conn.last_recv_us) >= self.cfg.idle_timeout_us
                 {
                     self.state = State::Closed;
                     self.events.push(ClientEvent::Disconnected(Closed::Timeout));
+                } else if self.conn.next_deadline().is_some_and(|t| t <= now_us) {
+                    self.conn.on_timeout(now_us);
                 }
             }
             State::Idle | State::Closed => {}
@@ -269,19 +263,17 @@ impl Client {
                             .saturating_add(self.cfg.handshake_timeout_us),
                     ),
             ),
-            State::Connected if !self.server_seen => Some(
-                self.last_tx_us
-                    .saturating_add(self.cfg.retry_interval_us)
-                    .min(
-                        self.started_us
-                            .saturating_add(self.cfg.handshake_timeout_us),
-                    ),
-            ),
-            State::Connected => Some(
-                self.peer
-                    .last_recv_us
-                    .saturating_add(self.cfg.idle_timeout_us),
-            ),
+            State::Connected => {
+                let end = if self.server_seen {
+                    self.conn
+                        .last_recv_us
+                        .saturating_add(self.cfg.idle_timeout_us)
+                } else {
+                    self.started_us
+                        .saturating_add(self.cfg.handshake_timeout_us)
+                };
+                Some(self.conn.next_deadline().map_or(end, |t| t.min(end)))
+            }
             State::Idle | State::Closed => None,
         }
     }
@@ -291,13 +283,8 @@ impl Client {
         match *o {
             Out::Hello => wire::write_hello(buf, &self.fields()),
             Out::Response => wire::write_response(buf, self.coarse, self.cookie, &self.fields()),
-            Out::Ping { pn } => {
-                let mut w = DataWriter::new(buf, channels.as_slice(), self.peer.token, pn as u16)?;
-                w.ping()?;
-                w.finish()
-            }
             Out::Disconnect { pn, reason } => {
-                let mut w = DataWriter::new(buf, channels.as_slice(), self.peer.token, pn as u16)?;
+                let mut w = DataWriter::new(buf, channels.as_slice(), self.conn.token, pn as u16)?;
                 w.disconnect(reason)?;
                 w.finish()
             }
@@ -316,6 +303,38 @@ impl Client {
                 return Some((self.server, n));
             }
         }
+        if self.state == State::Connected {
+            if let Some(n) = self.conn.build(now_us, buf) {
+                return Some((self.server, n));
+            }
+        }
         None
+    }
+
+    /// Queue a message for the server. See `Server::send`. / Поставить сообщение серверу в очередь.
+    pub fn send(&mut self, ch: u8, data: &[u8]) -> Result<(), SendError> {
+        if self.state != State::Connected {
+            return Err(SendError::NotConnected);
+        }
+        self.conn.send(ch, data)
+    }
+
+    /// The next received message, written into `buf` (at least [`MSG_MAX`] bytes): `(channel,
+    /// length)`. / Следующее принятое сообщение: `(канал, длина)`.
+    pub fn poll_recv(&mut self, buf: &mut [u8]) -> Option<(u8, usize)> {
+        if buf.len() < MSG_MAX || self.state != State::Connected {
+            return None;
+        }
+        let d = self.conn.poll_recv()?;
+        let payload = d.payload();
+        if let Some(dst) = buf.get_mut(..payload.len()) {
+            dst.copy_from_slice(payload);
+        }
+        Some((d.ch, payload.len()))
+    }
+
+    /// Counters, RTT and traffic of the connection. / Счётчики, RTT и трафик соединения.
+    pub fn conn_stats(&self) -> Option<ConnStats> {
+        (self.state == State::Connected).then(|| self.conn.stats())
     }
 }

@@ -11,10 +11,10 @@
 //! граница: слоты, таблица лимитов, очередь ответов, очередь событий.
 
 use crate::addr::Addr;
-use crate::config::ServerConfig;
+use crate::config::{ConfigError, ServerConfig};
+use crate::conn::{Conn, ConnStats, Refused, SendError, MSG_MAX};
 use crate::limit::{Bucket, RateTable};
 use crate::ring::Ring;
-use crate::session::Peer;
 use crate::siphash::{ct_eq_u64, siphash13};
 use crate::wire::{
     self, reject_code, DataWriter, Datagram, HelloFields, WriteError, MAX_DATAGRAM, WIRE_VERSION,
@@ -22,10 +22,6 @@ use crate::wire::{
 
 /// Queued replies waiting for `poll_transmit`. / Ответы в очереди на отправку.
 pub const REPLY_CAP: usize = 64;
-/// Confirmation PINGs a connection answers; later liveness comes from stage 3 (acks).
-/// Сколько подтверждающих PING сервер отправит соединению; дальше живость даст этап 3.
-const CONFIRM_REPLIES: u8 = 8;
-
 const TAG_COOKIE: u8 = 0x01;
 const TAG_TOKEN: u8 = 0x02;
 
@@ -73,7 +69,6 @@ enum Body {
     Challenge { coarse: u32, cookie: u64 },
     Accept { token: u64, echo: u64 },
     Reject { code: u8, echo: u64 },
-    Ping { token: u64, pn: u64 },
     Disconnect { token: u64, pn: u64, reason: u8 },
 }
 
@@ -114,18 +109,19 @@ pub struct ServerStats {
     pub rejected_config: u64,
     pub rejected_full: u64,
     pub rejected_source: u64,
+    pub deferred_pending: u64,
     pub replaced: u64,
     pub confirmed: u64,
     pub unknown_peer: u64,
     pub bad_token: u64,
     pub dropped_replay: u64,
+    pub refused_capacity: u64,
     pub unconfirmed_expired: u64,
     pub idle_expired: u64,
     pub replies_dropped: u64,
     pub events_lost: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
 struct Slot {
     used: bool,
     confirmed: bool,
@@ -134,12 +130,11 @@ struct Slot {
     addr_hash: u64,
     client_random: u64,
     created_us: u64,
-    confirm_replies_left: u8,
-    peer: Peer,
+    conn: Conn,
 }
 
 impl Slot {
-    fn empty() -> Self {
+    fn empty(cfg: &ServerConfig) -> Self {
         Self {
             used: false,
             confirmed: false,
@@ -148,10 +143,18 @@ impl Slot {
             addr_hash: 0,
             client_random: 0,
             created_us: 0,
-            confirm_replies_left: 0,
-            peer: Peer::new(0, 0),
+            conn: Conn::new(0, cfg.conn_config(), 0),
         }
     }
+}
+
+/// A message received from a connection, see [`Server::poll_recv`].
+/// Принятое сообщение, см. [`Server::poll_recv`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Received {
+    pub conn: ConnId,
+    pub ch: u8,
+    pub len: usize,
 }
 
 /// The server: `N` connection slots, `R` rate-limit entries, `E` event slots (`E >= 2N + 2`).
@@ -164,8 +167,8 @@ pub struct Server<const N: usize, const R: usize, const E: usize> {
     token_key: [u8; 16],
     hash_key: [u8; 16],
     next_rotation_us: u64,
-    next_check_us: u64,
     conn_counter: u64,
+    rr: usize,
     limiter: RateTable<R>,
     global: Bucket,
     slots: [Slot; N],
@@ -182,8 +185,9 @@ fn secs(now_us: u64) -> u32 {
 impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
     /// `seed` must be 32 fresh random bytes from the host; the core has no randomness.
     /// `seed`: 32 случайных байта от хозяина; у ядра своей случайности нет.
-    pub fn new(cfg: ServerConfig, seed: [u8; 32], now_us: u64) -> Self {
+    pub fn new(cfg: ServerConfig, seed: [u8; 32], now_us: u64) -> Result<Self, ConfigError> {
         const { assert!(E >= 2 * N + 2, "event queue must hold two events per slot") };
+        cfg.validate()?;
         let (a, b) = seed.split_at(16);
         let mut secret = [0u8; 16];
         let mut token_key = [0u8; 16];
@@ -194,7 +198,7 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
         let h1 = siphash13(&secret, b"voidnet addr hash 1");
         hash_key[..8].copy_from_slice(&h0.to_le_bytes());
         hash_key[8..].copy_from_slice(&h1.to_le_bytes());
-        Self {
+        Ok(Self {
             cfg,
             secret,
             prev_secret: secret,
@@ -202,16 +206,16 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
             token_key,
             hash_key,
             next_rotation_us: now_us.saturating_add(cfg.rotation_interval_us),
-            next_check_us: u64::MAX,
             conn_counter: 0,
+            rr: 0,
             limiter: RateTable::new(),
             global: Bucket::default(),
-            slots: [Slot::empty(); N],
+            slots: core::array::from_fn(|_| Slot::empty(&cfg)),
             used: 0,
             replies: Ring::new(),
             events: Ring::new(),
             stats: ServerStats::default(),
-        }
+        })
     }
 
     pub fn stats(&self) -> &ServerStats {
@@ -239,8 +243,23 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
     /// When the host should call [`handle_timeout`](Self::handle_timeout) or
     /// [`rotate_secret`](Self::rotate_secret) next. / Когда хозяину звать в следующий раз.
     pub fn next_deadline(&self) -> Option<u64> {
-        let t = self.next_check_us.min(self.next_rotation_us);
+        let mut t = self.next_rotation_us;
+        for s in self.slots.iter().filter(|s| s.used) {
+            t = t.min(self.expiry(s));
+            if let Some(d) = s.conn.next_deadline() {
+                t = t.min(d);
+            }
+        }
         (t != u64::MAX).then_some(t)
+    }
+
+    /// When a slot is dropped for silence. / Когда слот снимается за молчание.
+    fn expiry(&self, s: &Slot) -> u64 {
+        if s.confirmed {
+            s.conn.last_recv_us.saturating_add(self.cfg.idle_timeout_us)
+        } else {
+            s.created_us.saturating_add(self.cfg.unconfirmed_timeout_us)
+        }
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -272,11 +291,17 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
             .position(|s| s.used && s.addr_hash == h && s.addr == *a)
     }
 
-    fn same_source(&self, a: &Addr) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| s.used && s.addr.source() == a.source())
-            .count()
+    /// `(all, pending)` connections that share the source of `a`.
+    fn same_source(&self, a: &Addr) -> (usize, usize) {
+        let mut all = 0;
+        let mut pending = 0;
+        for s in &self.slots {
+            if s.used && s.addr.source() == a.source() {
+                all += 1;
+                pending += usize::from(!s.confirmed);
+            }
+        }
+        (all, pending)
     }
 
     fn cookie_for(&self, secret: &[u8; 16], a: &Addr, coarse: u32, h: &HelloFields) -> u64 {
@@ -446,7 +471,7 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
         }
         let mut reuse: Option<usize> = None;
         if let Some(i) = self.find(from) {
-            let same = self.slots.get(i).map(|s| (s.client_random, s.peer.token));
+            let same = self.slots.get(i).map(|s| (s.client_random, s.conn.token));
             if let Some((rnd, token)) = same {
                 if rnd == h.client_random {
                     // the Accept was lost on its way: say it again
@@ -460,7 +485,14 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
             self.close(i, Closed::Replaced);
             reuse = Some(i);
         }
-        if self.same_source(from) >= self.cfg.max_per_source {
+        let (all, pending) = self.same_source(from);
+        if pending >= self.cfg.max_pending_per_source {
+            // Not final: earlier half-open connections of this source will confirm or expire.
+            // No reply, so the client keeps retrying and gets in when there is room.
+            self.stats.deferred_pending += 1;
+            return;
+        }
+        if all >= self.cfg.max_per_source {
             self.stats.rejected_source += 1;
             self.reply(
                 *from,
@@ -496,12 +528,8 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
             s.addr_hash = addr_hash;
             s.client_random = h.client_random;
             s.created_us = now_us;
-            s.confirm_replies_left = CONFIRM_REPLIES;
-            s.peer = Peer::new(token, now_us);
+            s.conn = Conn::new(token, self.cfg.conn_config(), now_us);
             self.used += 1;
-            self.next_check_us = self
-                .next_check_us
-                .min(now_us.saturating_add(self.cfg.unconfirmed_timeout_us));
             self.stats.accepted += 1;
             self.reply(
                 *from,
@@ -522,10 +550,14 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
         let Some(slot) = self.slots.get_mut(idx) else {
             return;
         };
-        let acc = match slot.peer.receive(dd, now_us) {
+        let acc = match slot.conn.on_datagram(dd, now_us) {
             Ok(a) => a,
-            Err(crate::session::Refused::BadToken) => {
+            Err(Refused::BadToken) => {
                 self.stats.bad_token += 1;
+                return;
+            }
+            Err(Refused::Capacity) => {
+                self.stats.refused_capacity += 1;
                 return;
             }
             Err(_) => {
@@ -540,21 +572,11 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
         let addr = slot.addr;
         let first = !slot.confirmed;
         slot.confirmed = true;
-        let want_ping = (first || acc.ping) && slot.confirm_replies_left > 0;
-        let (token, pn) = if want_ping {
-            slot.confirm_replies_left -= 1;
-            (slot.peer.token, slot.peer.next_pn())
-        } else {
-            (0, 0)
-        };
         if first {
             self.stats.confirmed += 1;
             if !self.events.push(Event::Connected { conn, addr }) {
                 self.stats.events_lost += 1;
             }
-        }
-        if want_ping {
-            self.reply(addr, Body::Ping { token, pn });
         }
         if let Some(reason) = acc.disconnect {
             self.close(idx, Closed::Remote(reason));
@@ -572,10 +594,10 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
         if !(s.used && s.generation == conn.generation) {
             return false;
         }
-        let (to, token) = (s.addr, s.peer.token);
+        let (to, token) = (s.addr, s.conn.token);
         let mut pns = [0u64; 3];
         for p in &mut pns {
-            *p = s.peer.next_pn();
+            *p = s.conn.next_pn();
         }
         for pn in pns {
             self.reply(to, Body::Disconnect { token, pn, reason });
@@ -607,35 +629,24 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
     /// Drop connections that went silent. Call when [`next_deadline`](Self::next_deadline)
     /// has passed. / Снять замолчавшие соединения; звать по сроку `next_deadline`.
     pub fn handle_timeout(&mut self, now_us: u64) {
-        let mut next = u64::MAX;
         for i in 0..N {
             let Some(s) = self.slots.get(i) else { break };
             if !s.used {
                 continue;
             }
-            let (deadline, confirmed) = if s.confirmed {
-                (
-                    s.peer.last_recv_us.saturating_add(self.cfg.idle_timeout_us),
-                    true,
-                )
-            } else {
-                (
-                    s.created_us.saturating_add(self.cfg.unconfirmed_timeout_us),
-                    false,
-                )
-            };
-            if now_us >= deadline {
-                if confirmed {
+            if now_us >= self.expiry(s) {
+                if s.confirmed {
                     self.stats.idle_expired += 1;
                 } else {
                     self.stats.unconfirmed_expired += 1;
                 }
                 self.close(i, Closed::Timeout);
-            } else {
-                next = next.min(deadline);
+            } else if let Some(s) = self.slots.get_mut(i) {
+                if s.conn.next_deadline().is_some_and(|t| t <= now_us) {
+                    s.conn.on_timeout(now_us);
+                }
             }
         }
-        self.next_check_us = next;
     }
 
     fn encode(&self, r: &Reply, out: &mut [u8]) -> Result<usize, WriteError> {
@@ -646,11 +657,6 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
                 wire::write_accept(out, token, echo, 0, self.cfg.accept_blob.as_bytes())
             }
             Body::Reject { code, echo } => wire::write_reject(out, code, echo),
-            Body::Ping { token, pn } => {
-                let mut w = DataWriter::new(out, channels.as_slice(), token, pn as u16)?;
-                w.ping()?;
-                w.finish()
-            }
             Body::Disconnect { token, pn, reason } => {
                 let mut w = DataWriter::new(out, channels.as_slice(), token, pn as u16)?;
                 w.disconnect(reason)?;
@@ -663,18 +669,86 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
     /// (at least 1400 bytes). `None` when nothing is queued.
     /// Следующая датаграмма к отправке: `(адрес, длина)`, записана в `buf` (не меньше 1400 байт).
     pub fn poll_transmit(&mut self, buf: &mut [u8], now_us: u64) -> Option<(Addr, usize)> {
-        if now_us >= self.next_check_us {
-            self.handle_timeout(now_us);
-        }
         if buf.len() < MAX_DATAGRAM {
             return None;
         }
+        // handshake replies and disconnects first
         while let Some(r) = self.replies.pop() {
             if let Ok(n) = self.encode(&r, buf) {
                 self.stats.bytes_out += n as u64;
                 return Some((r.to, n));
             }
         }
+        // then the connections, taking turns so that one busy client cannot starve the rest
+        for k in 0..N {
+            let i = (self.rr + k) % N;
+            let Some(s) = self.slots.get_mut(i) else {
+                continue;
+            };
+            if !s.used {
+                continue;
+            }
+            if let Some(n) = s.conn.build(now_us, buf) {
+                self.rr = (i + 1) % N;
+                self.stats.bytes_out += n as u64;
+                return Some((s.addr, n));
+            }
+        }
         None
+    }
+
+    fn slot_mut(&mut self, conn: ConnId) -> Option<&mut Slot> {
+        let s = self.slots.get_mut(conn.index as usize)?;
+        (s.used && s.confirmed && s.generation == conn.generation).then_some(s)
+    }
+
+    /// Queue a message for a connection. Reliable messages are either queued whole or refused
+    /// with [`SendError::Full`]; the host decides what to do about a peer that cannot keep up.
+    /// Поставить сообщение соединению в очередь. Надёжное либо встаёт целиком, либо отклоняется
+    /// с [`SendError::Full`]; что делать с отстающим пиром, решает хозяин.
+    pub fn send(&mut self, conn: ConnId, ch: u8, data: &[u8]) -> Result<(), SendError> {
+        self.slot_mut(conn)
+            .ok_or(SendError::NotConnected)?
+            .conn
+            .send(ch, data)
+    }
+
+    /// The next received message from any connection, written into `buf` (at least
+    /// [`MSG_MAX`] bytes). Connections are served in turn. `None` when nothing is waiting.
+    /// Следующее принятое сообщение от любого соединения; соединения обслуживаются по кругу.
+    pub fn poll_recv(&mut self, buf: &mut [u8]) -> Option<Received> {
+        if buf.len() < MSG_MAX {
+            return None;
+        }
+        for k in 0..N {
+            let i = (self.rr + k) % N;
+            let Some(s) = self.slots.get_mut(i) else {
+                continue;
+            };
+            if !(s.used && s.confirmed) {
+                continue;
+            }
+            if let Some(d) = s.conn.poll_recv() {
+                let payload = d.payload();
+                if let Some(dst) = buf.get_mut(..payload.len()) {
+                    dst.copy_from_slice(payload);
+                }
+                return Some(Received {
+                    conn: ConnId {
+                        index: i as u32,
+                        generation: s.generation,
+                    },
+                    ch: d.ch,
+                    len: payload.len(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Counters, RTT and traffic of one connection. / Счётчики, RTT и трафик соединения.
+    pub fn conn_stats(&self, conn: ConnId) -> Option<ConnStats> {
+        let s = self.slots.get(conn.index as usize)?;
+        (s.used && s.confirmed && s.generation == conn.generation).then(|| s.conn.stats())
     }
 }

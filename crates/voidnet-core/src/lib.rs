@@ -24,12 +24,12 @@ pub mod ack;
 pub mod addr;
 pub mod client;
 pub mod config;
+pub mod conn;
 pub mod dump;
 pub mod io;
 pub mod limit;
 pub mod ring;
 pub mod server;
-pub mod session;
 pub mod siphash;
 pub mod varint;
 pub mod window;
@@ -38,8 +38,9 @@ pub mod wire;
 pub use ack::AckFrame;
 pub use addr::Addr;
 pub use client::{Client, ClientEvent, Failed};
-pub use config::{Blob, ChannelTable, ClientConfig, ServerConfig};
-pub use server::{Closed, ConnId, Event, Server};
+pub use config::{Blob, ChannelTable, ClientConfig, ConfigError, ServerConfig};
+pub use conn::{Conn, ConnConfig, ConnStats, SendError};
+pub use server::{Closed, ConnId, Event, Received, Server};
 pub use wire::{
     ChannelMode, DataDatagram, DataWriter, Datagram, Frame, HelloFields, ParseError, WriteError,
 };

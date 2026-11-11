@@ -140,7 +140,7 @@ REJECT     84 | code:u8 | echo:u64                                       (10 byt
 - `echo`: the client's `client_random`. A client accepts ACCEPT or REJECT only if `echo` matches the value it sent; this stops an off-path attacker from forging them.
 - `token`: the session token (section 5).
 - `blob`: up to 32 bytes of application data from server to client (for example game parameters); `blob_len <= 32`.
-- `code` in REJECT: `1` version (wire version, protocol id or app version), `2` config mismatch, `3` server full, `4` rate limited, `5` too many connections from this source. Other values are application-defined.
+- `code` in REJECT: `1` version (wire version, protocol id or app version), `2` config mismatch, `3` server full, `4` rate limited, `5` too many connections from this source (a limit on *unconfirmed* connections from one source is not answered with a REJECT: the client keeps retrying and gets in when there is room). Other values are application-defined.
 
 ## 4. Sizes
 
@@ -185,17 +185,44 @@ client                         server
 ```
 
 - **No server state before a valid cookie.** A RESPONSE takes a slot, but the host is told about the connection only when the client's first authentic DATA arrives (confirmed). A pending connection that is never confirmed is dropped silently after a timeout (default 5 s). This keeps clients that never completed the handshake invisible to the application and short-lived in the table.
-- **Confirmation.** After ACCEPT the client sends a PING in a DATA datagram, and repeats it every retry interval until it receives any authentic DATA from the server. The server answers PING with a PING for the first few times it sees one (default 8), which confirms the path both ways. Later stages replace this with acknowledgements.
+- **Confirmation.** After ACCEPT the client sends a PING in a DATA datagram. The server acknowledges it at once (a PING is acknowledged without delay), and that acknowledgement is the first authentic DATA the client sees, which confirms the path both ways. If the PING is lost the probe timeout sends another.
 - **Limits at the server.** Per-source token bucket for HELLO, then a global bucket for HELLO (the per-source one goes first so one address cannot drain the global one), a cap on connections per source, a cap on all connections. A refused request gets REJECT only when that is cheap and safe (version, config, full, source limit); rate-limited requests get no reply.
 - **Same address connects again:** a valid RESPONSE with the same `client_random` repeats ACCEPT with the same token (idempotent, covers a lost ACCEPT); with a different `client_random` the old connection is closed (the host sees it as replaced) and a new one is created.
 - **Client retries.** HELLO or RESPONSE is resent every retry interval (default 500 ms). After a few RESPONSE resends without an answer (default 4) the client starts over with a new HELLO, which recovers from a forged or stale CHALLENGE. The whole attempt times out after the handshake timeout (default 10 s).
-- **Idle timeout** (default 30 s of no authentic datagram) ends a connection on either side. Keep-alive arrives with stage 3.
+- **Idle timeout** (default 30 s of no authentic datagram) ends a connection on either side; keep-alive (section 7) keeps an idle connection open.
 - Timeouts, intervals and limits are host configuration, not wire values.
 
-## 7. Versioning
+## 7. Delivery and liveness rules (behaviour, not layout)
+
+The layouts above are enough to parse; these rules are what makes two implementations behave
+alike. Values in brackets are defaults of the reference implementation.
+
+**Acknowledgements.**
+- A datagram with any frame other than ACK is *ack-eliciting*. Receiving one makes an acknowledgement *owed*.
+- An owed acknowledgement is sent in the next datagram of any kind (it rides along, there is no extra datagram), or on its own when it has waited `max_ack_delay` [25 ms], or at once when the datagram contained a PING or when two ack-eliciting datagrams are waiting.
+- `delay` in the ACK frame is the time since the largest acknowledged packet arrived, in units of 32 microseconds.
+- A datagram that is refused (wrong token, duplicate, too old, or a message the receiver cannot keep) is **not** acknowledged.
+
+**RTT.** When an ACK frame newly acknowledges its own `largest` and that packet was ack-eliciting, the sample is `now - time_sent - min(delay, max_ack_delay)`. `srtt = 7/8 srtt + 1/8 sample`, `rttvar = 3/4 rttvar + 1/4 |srtt - sample|`; the first sample sets `srtt = sample`, `rttvar = sample / 2`. Before a sample the RTT is assumed [100 ms].
+
+**Loss.** A packet is lost when an acknowledgement covers a packet at least 3 numbers above it, or when it is older than `9/8 * max(srtt, latest sample)` and an acknowledgement covers a later packet. The reliable messages it carried are queued again, under a new packet number.
+
+**Probe timeout.** `pto = srtt + max(4 * rttvar, 1 ms) + max_ack_delay`. If the newest ack-eliciting packet has been unacknowledged for `pto * 2^k` (k counts timeouts since the last acknowledgement, at most 6), the sender sends two probes: the oldest unacknowledged reliable message again, or a PING if there is none. An acknowledgement resets `k`. There is no congestion window; a dead path costs one probe per backed-off interval and a keep-alive.
+
+**Keep-alive and idle.** After `keepalive` [1 s] without sending any datagram, a PING is sent. A connection with no authentic datagram for the idle timeout [30 s] is closed on that side. A sender never lets its packet numbers run 2^14 ahead of the largest one the peer acknowledged.
+
+**Modes.**
+- `reliable_ordered`: at most 16 messages in flight per channel (the *window*). A message that does not fit the window is refused whole (`Full`), never half queued. The receiver keeps messages that arrive early, delivers in order, and refuses (without acknowledging) a datagram holding a reliable message 16 or more ahead of the next one it expects. Messages already delivered are ignored when they arrive again.
+- `unreliable_sequenced`: delivered only if newer than the newest delivered so far.
+- `unreliable`: delivered as it arrives. Up to 8 messages wait to be sent; a new one replaces the oldest when the queue is full, so an unreliable message never waits behind anything.
+- A message is at most 1200 bytes. The receiver holds at most 8 messages for the host; when the host does not read, reliable messages wait in the window (backpressure), unreliable ones are dropped.
+
+**Build-time profile.** The window (16), the number of reliable channels (2), the queue sizes, the history of 64 tracked packets and the message size (1200) are constants of the library build, so the memory of a connection is known in advance (about 100 KiB). A different profile is a different build and does not change the wire format.
+
+## 8. Versioning
 
 `wire_version` (one byte in HELLO) identifies this document's layouts. Frame tags `0x13`-`0x1F`, the kind `0x01` and the `caps` bits are reserved for extensions. A change to any layout in this file requires a new `wire_version`.
 
-## 8. Vectors
+## 9. Vectors
 
 `vectors/wire-v1.txt` lists byte strings and the canonical description of how each must be read. See the header of that file for the line format and the channel table the vectors assume. An implementation conforms when it produces exactly the listed description for every line and drops exactly the lines marked `drop`.

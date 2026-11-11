@@ -40,3 +40,10 @@ path = "fuzz_targets/handshake_flood.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "conn_stream"
+path = "fuzz_targets/conn_stream.rs"
+test = false
+doc = false
+bench = false

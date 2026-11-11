@@ -1,6 +1,7 @@
 //! Configuration shared by server and client, and the wire-relevant configuration hash.
 //! Настройки сервера и клиента и хеш настроек, влияющих на провод.
 
+use crate::conn::{ConnConfig, MAX_RELIABLE_CHANNELS};
 use crate::siphash::siphash13;
 use crate::wire::{ChannelMode, MAX_BLOB, MAX_CHANNELS, MAX_DATAGRAM};
 
@@ -59,6 +60,30 @@ impl ChannelTable {
 /// Ключ `config_hash`: ASCII `voidnet-cfg-v1` и два нулевых байта.
 pub const CONFIG_HASH_KEY: [u8; 16] = *b"voidnet-cfg-v1\0\0";
 
+/// Why a configuration cannot be used by this build. / Почему настройки не подходят этой сборке.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigError {
+    /// More reliable channels than the build keeps state for (`MAX_RELIABLE_CHANNELS`).
+    TooManyReliableChannels,
+    /// `max_datagram` outside what the core can build. / Недопустимый размер датаграммы.
+    BadDatagramSize,
+}
+
+fn check(channels: &ChannelTable, max_datagram: u16) -> Result<(), ConfigError> {
+    let reliable = channels
+        .as_slice()
+        .iter()
+        .filter(|m| **m == ChannelMode::ReliableOrdered)
+        .count();
+    if reliable > MAX_RELIABLE_CHANNELS {
+        return Err(ConfigError::TooManyReliableChannels);
+    }
+    if usize::from(max_datagram) > MAX_DATAGRAM || usize::from(max_datagram) < 64 {
+        return Err(ConfigError::BadDatagramSize);
+    }
+    Ok(())
+}
+
 /// Application data sent to the client in ACCEPT. / Данные приложения клиенту в ACCEPT.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Blob {
@@ -107,7 +132,13 @@ pub struct ServerConfig {
     pub max_datagram: u16,
     /// At most the `N` of the server type. / Не больше `N` типа сервера.
     pub max_connections: usize,
-    /// Connections from one source (address prefix), confirmed or not.
+    /// Connections from one source (address prefix) that the client has not yet confirmed with
+    /// data. This is what protects the table from half-open hoarding; honest players confirm
+    /// within one round trip, so a crowd behind one NAT is not affected.
+    pub max_pending_per_source: usize,
+    /// All connections from one source, confirmed or not. `usize::MAX` means no limit; set it
+    /// that way (or high) for LAN servers and NAT-heavy audiences. Per-address policy for real
+    /// players (for example "4 per IP") belongs to the host.
     pub max_per_source: usize,
     /// HELLO per source: refill per second and burst.
     pub hello_rate_per_s: u32,
@@ -124,6 +155,13 @@ pub struct ServerConfig {
     pub unconfirmed_timeout_us: u64,
     /// A connection with no valid datagram for this long is closed.
     pub idle_timeout_us: u64,
+    /// How long an acknowledgement may wait for a data datagram to ride on. One simulation
+    /// tick is a good value for a game.
+    pub max_ack_delay_us: u64,
+    /// Send a PING after this long without sending anything. 0 disables keep-alive.
+    pub keepalive_us: u64,
+    /// RTT assumed before the first measurement.
+    pub initial_rtt_us: u64,
     pub accept_blob: Blob,
 }
 
@@ -135,7 +173,8 @@ impl ServerConfig {
             channels,
             max_datagram: MAX_DATAGRAM as u16,
             max_connections: usize::MAX,
-            max_per_source: 8,
+            max_pending_per_source: 4,
+            max_per_source: 16,
             hello_rate_per_s: 20,
             hello_burst: 10,
             global_rate_per_s: 5_000,
@@ -144,12 +183,29 @@ impl ServerConfig {
             rotation_interval_us: 240_000_000,
             unconfirmed_timeout_us: 5_000_000,
             idle_timeout_us: 30_000_000,
+            max_ack_delay_us: 25_000,
+            keepalive_us: 1_000_000,
+            initial_rtt_us: 100_000,
             accept_blob: Blob::default(),
         }
     }
 
     pub fn config_hash(&self) -> u32 {
         self.channels.config_hash(self.max_datagram)
+    }
+
+    /// Settings of every connection this server holds. / Настройки каждого соединения сервера.
+    pub fn conn_config(&self) -> ConnConfig {
+        ConnConfig {
+            channels: self.channels,
+            max_ack_delay_us: self.max_ack_delay_us,
+            keepalive_us: self.keepalive_us,
+            initial_rtt_us: self.initial_rtt_us,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        check(&self.channels, self.max_datagram)
     }
 }
 
@@ -167,6 +223,9 @@ pub struct ClientConfig {
     /// Give up on the handshake after this long.
     pub handshake_timeout_us: u64,
     pub idle_timeout_us: u64,
+    pub max_ack_delay_us: u64,
+    pub keepalive_us: u64,
+    pub initial_rtt_us: u64,
 }
 
 impl ClientConfig {
@@ -180,11 +239,27 @@ impl ClientConfig {
             response_retries: 4,
             handshake_timeout_us: 10_000_000,
             idle_timeout_us: 30_000_000,
+            max_ack_delay_us: 25_000,
+            keepalive_us: 1_000_000,
+            initial_rtt_us: 100_000,
         }
     }
 
     pub fn config_hash(&self) -> u32 {
         self.channels.config_hash(self.max_datagram)
+    }
+
+    pub fn conn_config(&self) -> ConnConfig {
+        ConnConfig {
+            channels: self.channels,
+            max_ack_delay_us: self.max_ack_delay_us,
+            keepalive_us: self.keepalive_us,
+            initial_rtt_us: self.initial_rtt_us,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        check(&self.channels, self.max_datagram)
     }
 }
 

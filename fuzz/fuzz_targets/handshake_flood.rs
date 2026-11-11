@@ -49,7 +49,21 @@ struct Known {
     token: Option<u64>,
 }
 
+// The server state is large and the core cannot build it in place without `unsafe`, so the body
+// runs on a thread with a big stack (the main thread of the fuzzer has 1 MB on Windows).
 fuzz_target!(|data: &[u8]| {
+    std::thread::scope(|s| {
+        let h = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn_scoped(s, || run(data))
+            .unwrap();
+        if let Err(e) = h.join() {
+            std::panic::resume_unwind(e);
+        }
+    });
+});
+
+fn run(data: &[u8]) {
     let channels = ChannelTable::new(&[
         ChannelMode::ReliableOrdered,
         ChannelMode::Unreliable,
@@ -57,9 +71,9 @@ fuzz_target!(|data: &[u8]| {
     ])
     .unwrap();
     let mut cfg = ServerConfig::new(PID, channels);
-    cfg.max_connections = 6;
+    cfg.max_connections = 4;
     cfg.max_per_source = 3;
-    let mut srv: Server<8, 16, 32> = Server::new(cfg, [7; 32], 1_000_000_000);
+    let mut srv: Server<4, 16, 32> = Server::new(cfg, [7; 32], 1_000_000_000).unwrap();
     let table = channels;
 
     // twelve addresses: four IPs with three ports each
@@ -76,6 +90,10 @@ fuzz_target!(|data: &[u8]| {
         let who = usize::from(who) % POOL;
         let addr = pool[who];
         let mut input: Vec<u8> = Vec::new();
+        // I1 covers datagrams from addresses that have not proved themselves; DATA with the
+        // token the server really issued comes from a validated peer and may be answered
+        // with more (an acknowledgement is longer than the PING it answers)
+        let mut unverified = true;
         match op % 8 {
             0 => {
                 // raw bytes
@@ -114,7 +132,10 @@ fuzz_target!(|data: &[u8]| {
                 let Some(pn) = r.u8() else { break };
                 let Some(kind) = r.u8() else { break };
                 let token = match known[who].token {
-                    Some(t) if kind & 0x80 == 0 => t,
+                    Some(t) if kind & 0x80 == 0 => {
+                        unverified = false;
+                        t
+                    }
                     Some(t) => t ^ 1,
                     None => 0xABCD,
                 };
@@ -167,9 +188,9 @@ fuzz_target!(|data: &[u8]| {
                     }
                 }
                 // I1
-                assert!(n <= in_len, "reply {n} B to a {in_len} B datagram");
+                assert!(!unverified || n <= in_len, "reply {n} B to a {in_len} B datagram");
             }
-            assert!(replies <= 1, "one datagram caused {replies} replies");
+            assert!(replies <= 1 || !unverified, "one datagram caused {replies} replies");
         }
 
         // drain events like a host; handles may go stale, that is fine
@@ -179,11 +200,11 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         // I3 and "no event is lost"
-        assert!(srv.slots_in_use() <= 6);
+        assert!(srv.slots_in_use() <= 4);
         assert!(srv.pending_replies() <= voidnet_core::server::REPLY_CAP);
         assert_eq!(srv.stats().events_lost, 0);
     }
-});
+}
 
 fn wire_hello(buf: &mut [u8], h: &HelloFields) -> Vec<u8> {
     let n = wire::write_hello(buf, h).unwrap();

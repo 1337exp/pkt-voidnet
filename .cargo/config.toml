@@ -1,0 +1,4 @@
+[env]
+# Connection state is large (about 100 KB each) and the core cannot initialise in place without
+# unsafe, so tests that hold several servers need more than the default 2 MB test-thread stack.
+RUST_MIN_STACK = "67108864"

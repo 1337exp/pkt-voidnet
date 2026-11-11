@@ -32,6 +32,9 @@ pub struct World<const N: usize, const R: usize, const E: usize> {
     rotation_us: u64,
     /// When false the world does not drain `Server::poll_event` by itself.
     pub drain_events: bool,
+    /// At most this many datagrams leave the server per tick (a host with a limited send
+    /// budget); `None` means no limit.
+    pub server_budget: Option<usize>,
 }
 
 impl<const N: usize, const R: usize, const E: usize> World<N, R, E> {
@@ -45,7 +48,7 @@ impl<const N: usize, const R: usize, const E: usize> World<N, R, E> {
         Self {
             now,
             tick_us: 1_000,
-            server: Server::new(cfg, s, now),
+            server: Server::new(cfg, s, now).expect("valid server config"),
             peers: Vec::new(),
             server_events: Vec::new(),
             stray: Vec::new(),
@@ -53,13 +56,14 @@ impl<const N: usize, const R: usize, const E: usize> World<N, R, E> {
             rotation_us: cfg.rotation_interval_us,
             rng,
             drain_events: true,
+            server_budget: None,
         }
     }
 
     /// Add a client and start its connection attempt. / Добавить клиента и начать соединение.
     pub fn add_client(&mut self, addr: Addr, cfg: ClientConfig, link: Params) -> usize {
         let seed = self.rng.next_u64();
-        let mut c = Client::new(cfg);
+        let mut c = Client::new(cfg).expect("valid client config");
         let random = self.rng.next_u64();
         c.connect(self.server_addr(), random, self.now);
         self.peers.push(Peer {
@@ -84,7 +88,7 @@ impl<const N: usize, const R: usize, const E: usize> World<N, R, E> {
         let server = self.server_addr();
         let now = self.now;
         if let Some(p) = self.peers.get_mut(idx) {
-            p.client = Client::new(cfg);
+            p.client = Client::new(cfg).expect("valid client config");
             p.client.connect(server, random, now);
         }
     }
@@ -97,7 +101,12 @@ impl<const N: usize, const R: usize, const E: usize> World<N, R, E> {
 
     fn route_server_output(&mut self) {
         let mut buf = [0u8; 1500];
-        while let Some((to, n)) = self.server.poll_transmit(&mut buf, self.now) {
+        let mut left = self.server_budget.unwrap_or(usize::MAX);
+        while left > 0 {
+            let Some((to, n)) = self.server.poll_transmit(&mut buf, self.now) else {
+                break;
+            };
+            left -= 1;
             let data = buf.get(..n).unwrap_or(&[]);
             match self.peers.iter_mut().find(|p| p.addr == to) {
                 Some(p) => p.down.send(self.now, data),
@@ -136,9 +145,8 @@ impl<const N: usize, const R: usize, const E: usize> World<N, R, E> {
             self.server.rotate_secret(fresh, now);
             self.next_rotation = now + self.rotation_us;
         }
-        if self.server.next_deadline().is_some_and(|t| t <= now) {
-            self.server.handle_timeout(now);
-        }
+        // a host calls this every loop iteration; it does nothing unless something is due
+        self.server.handle_timeout(now);
         self.route_server_output();
         if self.drain_events {
             while let Some(e) = self.server.poll_event() {
@@ -168,7 +176,7 @@ impl<const N: usize, const R: usize, const E: usize> World<N, R, E> {
 
     /// Run until `done` is true or `limit_us` has passed; returns whether `done` held.
     /// Гнать, пока `done` не станет истиной или не пройдёт `limit_us`.
-    pub fn run_until(&mut self, limit_us: u64, mut done: impl FnMut(&Self) -> bool) -> bool {
+    pub fn run_until(&mut self, limit_us: u64, mut done: impl FnMut(&mut Self) -> bool) -> bool {
         let end = self.now + limit_us;
         while self.now < end {
             if done(self) {

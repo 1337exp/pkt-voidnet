@@ -88,7 +88,7 @@ impl Raw {
     fn new(cfg: ServerConfig) -> Self {
         let seed: [u8; 32] = core::array::from_fn(|i| (i * 5 + 1) as u8);
         Self {
-            srv: Server::new(cfg, seed, 1_000_000_000),
+            srv: Server::new(cfg, seed, 1_000_000_000).unwrap(),
             cfg,
         }
     }
@@ -581,7 +581,7 @@ fn a_silent_server_means_timeout() {
 #[test]
 fn forged_answers_do_not_move_a_client() {
     let server = Addr::from_ipv4([10, 255, 255, 1], 7000);
-    let mut c = Client::new(client_cfg());
+    let mut c = Client::new(client_cfg()).unwrap();
     assert!(c.connect(server, 0x1111, 0));
     let mut buf = [0u8; MAX_DATAGRAM];
     c.poll_transmit(&mut buf, 0).unwrap(); // the HELLO
@@ -706,7 +706,7 @@ fn a_whole_scenario_is_reproducible_from_its_seed() {
     // golden: if this changes, behaviour changed (and it must be the same on every OS)
     let (hash, connected, _) = run(5);
     assert_eq!(connected, 5);
-    assert_eq!(hash, 0xf947_d65d_c607_ff5d, "golden trace: {hash:#018x}");
+    assert_eq!(hash, 0x6e5e_a2b6_3d29_b859, "golden trace: {hash:#018x}");
 }
 
 // ------------------------------------------------------------------ gaps found by mutation testing
@@ -787,4 +787,83 @@ fn a_client_recovers_from_a_forged_challenge() {
     assert!(w.run_until(9_000_000, |w| w.client_connected(0)
         && w.connected_events() == 1));
     assert!(w.server.stats().bad_cookie >= 1);
+}
+
+// ------------------------------------------------------------------ LAN and NAT
+
+#[test]
+fn a_crowd_behind_one_address_gets_in_when_the_host_allows_it() {
+    let mut cfg = server_cfg();
+    cfg.max_per_source = usize::MAX;
+    let mut w: World<32, 64, 80> = World::new(cfg, 20);
+    // thirty players with one IP and different ports, all joining at the same moment
+    for port in 0..30u16 {
+        w.add_client(ip(7, 7, 9000 + port), client_cfg(), clean());
+    }
+    assert!(
+        w.run_until(8_000_000, |w| w.connected_events() == 30),
+        "joined {}",
+        w.connected_events()
+    );
+    assert_eq!(w.server.slots_in_use(), 30);
+}
+
+#[test]
+fn half_open_connections_from_one_address_are_capped_but_confirmed_ones_are_not() {
+    let mut raw = Raw::new(server_cfg());
+    let t0 = 1_000_000_000u64;
+    // six handshakes from one IP that never send data: only four may stay half open
+    let mut accepted = 0;
+    for i in 0..6u16 {
+        let a = ip(3, 3, 8000 + i);
+        let h = hello_fields(&raw.cfg, u64::from(i));
+        let Some((coarse, cookie)) = raw.challenge(&a, u64::from(i), t0 + u64::from(i)) else {
+            continue;
+        };
+        let r = raw.ask(
+            &a,
+            &bytes_response(coarse, cookie, &h),
+            t0 + 10 + u64::from(i),
+        );
+        if r.first().is_some_and(|(_, b)| {
+            matches!(
+                wire::parse(b, raw.cfg.channels.as_slice()),
+                Ok(Datagram::Accept { .. })
+            )
+        }) {
+            accepted += 1;
+        }
+    }
+    assert_eq!(accepted, 4);
+    assert_eq!(
+        raw.srv.stats().deferred_pending,
+        2,
+        "no reply, the client will retry"
+    );
+    assert_eq!(raw.srv.stats().rejected_source, 0);
+}
+
+#[test]
+fn a_connection_the_client_has_not_confirmed_cannot_be_addressed_by_the_host() {
+    let mut raw = Raw::new(server_cfg());
+    let t0 = 1_000_000_000u64;
+    let a = ip(1, 1, 5000);
+    let h = hello_fields(&raw.cfg, 5);
+    let (coarse, cookie) = raw.challenge(&a, 5, t0).unwrap();
+    assert_eq!(
+        raw.ask(&a, &bytes_response(coarse, cookie, &h), t0).len(),
+        1
+    );
+    assert_eq!(raw.srv.slots_in_use(), 1, "a pending slot exists");
+    // the host never saw it, but a guess at the handle must not reach it either
+    let guess = voidnet_core::ConnId {
+        index: 0,
+        generation: 1,
+    };
+    assert_eq!(
+        raw.srv.send(guess, 0, b"hello?"),
+        Err(voidnet_core::SendError::NotConnected)
+    );
+    assert!(raw.srv.conn_stats(guess).is_none());
+    assert!(raw.srv.conn_addr(guess).is_none());
 }
