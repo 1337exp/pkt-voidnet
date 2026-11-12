@@ -343,6 +343,15 @@ impl Client {
         self.conn.send(ch, data)
     }
 
+    /// Send what is queued now. See `Server::flush`. / Отправить то, что в очереди.
+    pub fn flush(&mut self) -> Result<(), SendError> {
+        if self.state != State::Connected {
+            return Err(SendError::NotConnected);
+        }
+        self.conn.flush();
+        Ok(())
+    }
+
     /// The next received message, written into `buf` (at least [`MSG_MAX`] bytes): `(channel,
     /// length)`. / Следующее принятое сообщение: `(канал, длина)`.
     pub fn poll_recv(&mut self, buf: &mut [u8]) -> Option<(u8, usize)> {

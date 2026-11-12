@@ -57,7 +57,9 @@ fn sixty_four_clients_at_fifty_hertz() {
     for _ in 0..seconds * 50 {
         for (i, c) in conns.iter().enumerate() {
             w.server.send(*c, 1, &snap).unwrap();
+            w.server.flush(*c).unwrap();
             w.peers[i].client.send(1, &input).unwrap();
+            w.peers[i].client.flush().unwrap();
         }
         w.run_for(20_000);
         while w.server.poll_recv(&mut buf).is_some() {}

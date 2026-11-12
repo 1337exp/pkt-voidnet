@@ -119,7 +119,11 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             2 => {
-                // collect what this side wants to send
+                // collect what this side wants to send: with a flush (even arg) everything queued
+                // is due, without it only timers start a datagram
+                if arg & 1 == 0 {
+                    sides[me].conn.flush();
+                }
                 for _ in 0..6 {
                     match sides[me].conn.build(now, &mut buf) {
                         Some(n) => {

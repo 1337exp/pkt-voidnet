@@ -606,7 +606,8 @@ pub unsafe extern "C" fn vn_server_poll_event(srv: *mut Srv, out: *mut VnEvent) 
 }
 
 /// Queue a message for a connection. 0, or `VN_ERR_FULL` (the reliable window is full, nothing was
-/// queued), `VN_ERR_TOO_BIG`, `VN_ERR_NO_CHANNEL`, `VN_ERR_NOT_CONNECTED`.
+/// queued), `VN_ERR_TOO_BIG`, `VN_ERR_NO_CHANNEL`, `VN_ERR_NOT_CONNECTED`. Nothing is sent by this
+/// call: the message leaves with the next datagram, which `vn_server_flush` or a timer starts.
 #[no_mangle]
 pub unsafe extern "C" fn vn_server_send(
     srv: *mut Srv,
@@ -631,6 +632,19 @@ pub unsafe extern "C" fn vn_server_send(
         unsafe { slice::from_raw_parts(data, len) }
     };
     match s.send(conn_from(conn), ch, d) {
+        Ok(()) => VN_OK,
+        Err(e) => send_code(e),
+    }
+}
+
+/// Send what is queued for a connection now: the following `vn_server_poll_transmit` calls return
+/// the datagram(s). Does nothing if nothing is queued. 0, or `VN_ERR_NOT_CONNECTED`.
+#[no_mangle]
+pub unsafe extern "C" fn vn_server_flush(srv: *mut Srv, conn: VnConn) -> i32 {
+    let Some(s) = (unsafe { srv.as_mut() }) else {
+        return VN_ERR_INVALID;
+    };
+    match s.flush(conn_from(conn)) {
         Ok(()) => VN_OK,
         Err(e) => send_code(e),
     }
@@ -989,6 +1003,19 @@ pub unsafe extern "C" fn vn_client_send(
         unsafe { slice::from_raw_parts(data, len) }
     };
     match cl.send(ch, d) {
+        Ok(()) => VN_OK,
+        Err(e) => send_code(e),
+    }
+}
+
+/// Send what is queued now: the following `vn_client_poll_transmit` calls return the datagram(s).
+/// Does nothing if nothing is queued. 0, or `VN_ERR_NOT_CONNECTED`.
+#[no_mangle]
+pub unsafe extern "C" fn vn_client_flush(c: *mut Client) -> i32 {
+    let Some(cl) = (unsafe { c.as_mut() }) else {
+        return VN_ERR_INVALID;
+    };
+    match cl.flush() {
         Ok(()) => VN_OK,
         Err(e) => send_code(e),
     }

@@ -51,7 +51,9 @@ fn run(seed: u64, loss_permille: u32, seconds: u64) -> [(u64, u64, Vec<u64>); 2]
             let la = 20 + rng.below(80) as usize;
             let lb = 50 + rng.below(250) as usize;
             let _ = p.a.conn.send(UNRELIABLE, &vec![1u8; la]);
+            p.a.conn.flush();
             let _ = p.b.conn.send(UNRELIABLE, &vec![2u8; lb]);
+            p.b.conn.flush();
         }
         p.step();
         while p.a.conn.poll_recv().is_some() {}
@@ -98,10 +100,12 @@ fn explore_ack_only_share() {
             if p.now >= na {
                 na += a_period_us;
                 let _ = p.a.conn.send(UNRELIABLE, &[1u8; 30]);
+                p.a.conn.flush();
             }
             if p.now >= nb {
                 nb += b_period_us;
                 let _ = p.b.conn.send(UNRELIABLE, &[2u8; 120]);
+                p.b.conn.flush();
             }
             p.step();
             while p.a.conn.poll_recv().is_some() {}

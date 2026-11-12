@@ -94,6 +94,7 @@ fn reliable_arrives_once_in_order_over_a_hostile_link() {
                     Err(e) => panic!("{e:?}"),
                 }
             }
+            p.a.conn.flush();
             while let Some(d) = p.b.conn.poll_recv() {
                 assert_eq!(d.ch, RELIABLE);
                 got.push(check_body(d.payload()));
@@ -123,6 +124,7 @@ fn sequenced_never_goes_back_and_never_repeats() {
     p.run_until(30_000_000, |p| {
         if sent < 3000 && p.now % 10_000 == 0 {
             p.a.conn.send(SEQUENCED, &body(sent, &mut rng)).unwrap();
+            p.a.conn.flush();
             sent += 1;
         }
         while let Some(d) = p.b.conn.poll_recv() {
@@ -145,6 +147,7 @@ fn unreliable_is_never_delivered_twice_even_when_the_link_duplicates() {
     p.run_until(30_000_000, |p| {
         if sent < 3000 && p.now % 10_000 == 0 {
             p.a.conn.send(UNRELIABLE, &body(sent, &mut rng)).unwrap();
+            p.a.conn.flush();
             sent += 1;
         }
         while let Some(d) = p.b.conn.poll_recv() {
@@ -167,6 +170,7 @@ fn unreliable_never_waits_for_anything() {
     p.ab.params_mut().loss_permille = 1000;
     for i in 0..100u32 {
         p.a.conn.send(UNRELIABLE, &i.to_le_bytes()).unwrap();
+        p.a.conn.flush();
     }
     p.run_for(200_000);
     assert!(
@@ -178,6 +182,7 @@ fn unreliable_never_waits_for_anything() {
     p.ab.params_mut().loss_permille = 0;
     for i in 100..105u32 {
         p.a.conn.send(UNRELIABLE, &i.to_le_bytes()).unwrap();
+        p.a.conn.flush();
     }
     p.run_for(300_000);
     let mut got = Vec::new();
@@ -199,7 +204,9 @@ fn packet_numbers_only_go_up_and_never_repeat() {
         if n < 400_000 {
             for _ in 0..3 {
                 let _ = p.a.conn.send(RELIABLE, &body(n, &mut rng));
+                p.a.conn.flush();
                 let _ = p.a.conn.send(UNRELIABLE, &body(n, &mut rng));
+                p.a.conn.flush();
                 n += 1;
             }
         }
@@ -244,7 +251,9 @@ fn rtt_converges_to_the_real_round_trip() {
     let mut rng = Pcg32::new(5, 5);
     for i in 0..400u32 {
         p.a.conn.send(UNRELIABLE, &body(i, &mut rng)).unwrap();
+        p.a.conn.flush();
         p.b.conn.send(UNRELIABLE, &body(i, &mut rng)).unwrap();
+        p.b.conn.flush();
         p.run_for(25_000);
         while p.a.conn.poll_recv().is_some() {}
         while p.b.conn.poll_recv().is_some() {}
@@ -265,6 +274,7 @@ fn acknowledgement_delay_is_not_counted_as_network_time() {
     let mut p = Pair::new(c, clean(30_000), 6);
     for _ in 0..20 {
         p.a.conn.send(UNRELIABLE, b"ping me").unwrap();
+        p.a.conn.flush();
         p.run_for(300_000);
         while p.b.conn.poll_recv().is_some() {}
     }
@@ -282,6 +292,7 @@ fn acknowledgement_delay_is_not_counted_as_network_time() {
 fn a_dead_path_is_probed_with_backoff_and_recovers() {
     let mut p = Pair::new(cfg(), clean(20_000), 7);
     p.a.conn.send(RELIABLE, b"before").unwrap();
+    p.a.conn.flush();
     p.run_for(500_000);
     assert_eq!(p.b.conn.poll_recv().unwrap().payload(), b"before");
 
@@ -289,6 +300,7 @@ fn a_dead_path_is_probed_with_backoff_and_recovers() {
     p.ab.params_mut().loss_permille = 1000;
     p.ba.params_mut().loss_permille = 1000;
     p.a.conn.send(RELIABLE, b"during").unwrap();
+    p.a.conn.flush();
     let sent_before = p.a.conn.stats().packets_sent;
     p.run_for(10_000_000);
     let probes = p.a.conn.stats().packets_sent - sent_before;
@@ -311,12 +323,14 @@ fn a_single_lost_message_is_repaired_within_about_one_round_trip() {
     // warm up so the connection has an RTT estimate
     for _ in 0..30 {
         p.a.conn.send(UNRELIABLE, b"w").unwrap();
+        p.a.conn.flush();
         p.run_for(60_000);
         while p.b.conn.poll_recv().is_some() {}
     }
     // lose exactly the datagram that carries the reliable message
     p.ab.params_mut().loss_permille = 1000;
     p.a.conn.send(RELIABLE, b"important").unwrap();
+    p.a.conn.flush();
     p.run_for(2_000);
     p.ab.params_mut().loss_permille = 0;
     let t0 = p.now;
@@ -325,6 +339,7 @@ fn a_single_lost_message_is_repaired_within_about_one_round_trip() {
     let done = p.run_until(5_000_000, |p| {
         if p.now % 20_000 == 0 {
             p.a.conn.send(UNRELIABLE, &i.to_le_bytes()).unwrap();
+            p.a.conn.flush();
             i += 1;
         }
         while let Some(d) = p.b.conn.poll_recv() {
@@ -352,6 +367,7 @@ fn the_reliable_window_says_full_and_nothing_is_half_accepted() {
     p.ab.params_mut().loss_permille = 1000; // nothing is acknowledged
     for i in 0..REL_WINDOW as u32 {
         p.a.conn.send(RELIABLE, &i.to_le_bytes()).unwrap();
+        p.a.conn.flush();
     }
     assert_eq!(
         p.a.conn.send(RELIABLE, b"one too many"),
@@ -387,6 +403,7 @@ fn a_slow_host_applies_backpressure_instead_of_losing_reliable_messages() {
                 Err(e) => panic!("{e:?}"),
             }
         }
+        p.a.conn.flush();
         // the host reads only once in a while, and only two at a time
         if p.now % 400_000 == 0 {
             for _ in 0..2 {
@@ -444,7 +461,9 @@ fn steady_game_traffic_needs_almost_no_ack_only_datagrams() {
     let mut rng = Pcg32::new(12, 12);
     for i in 0..500u32 {
         p.a.conn.send(UNRELIABLE, &body(i, &mut rng)).unwrap();
+        p.a.conn.flush();
         p.b.conn.send(UNRELIABLE, &body(i, &mut rng)).unwrap();
+        p.b.conn.flush();
         p.run_for(20_000);
         while p.a.conn.poll_recv().is_some() {}
         while p.b.conn.poll_recv().is_some() {}
@@ -470,7 +489,9 @@ fn received_bytes_match_sent_bytes_on_a_clean_link() {
     let mut rng = Pcg32::new(14, 14);
     for i in 0..200u32 {
         p.a.conn.send(UNRELIABLE, &body(i, &mut rng)).unwrap();
+        p.a.conn.flush();
         p.b.conn.send(UNRELIABLE, &body(i, &mut rng)).unwrap();
+        p.b.conn.flush();
         p.run_for(20_000);
         while p.a.conn.poll_recv().is_some() {}
         while p.b.conn.poll_recv().is_some() {}
@@ -506,6 +527,7 @@ fn a_whole_exchange_is_reproducible() {
             if n < 200 && p.a.conn.send(RELIABLE, &body(n, &mut rng)).is_ok() {
                 n += 1;
             }
+            p.a.conn.flush();
             while p.b.conn.poll_recv().is_some() {}
             false
         });

@@ -213,6 +213,8 @@ fn null_pointers_are_refused_not_followed() {
             vn_server_poll_recv(n as *mut _, buf.as_mut_ptr(), 1500, &mut rx),
             VN_ERR_INVALID
         );
+        assert_eq!(vn_server_flush(n as *mut _, conn), VN_ERR_INVALID);
+        assert_eq!(vn_client_flush(n as *mut _), VN_ERR_INVALID);
         assert_eq!(vn_server_disconnect(n as *mut _, conn, 0), VN_ERR_INVALID);
         assert_eq!(vn_client_connect(n as *mut _, &a, 1, NOW), VN_ERR_INVALID);
         assert_eq!(vn_client_is_connected(n as *const _), 0);
@@ -237,6 +239,11 @@ fn null_pointers_are_refused_not_followed() {
         assert_eq!(vn_server_send(s, conn, 0, n, 3), VN_ERR_INVALID);
         assert_eq!(
             vn_server_send(s, conn, 0, buf.as_ptr(), 3),
+            VN_ERR_NOT_CONNECTED,
+            "no such connection"
+        );
+        assert_eq!(
+            vn_server_flush(s, conn),
             VN_ERR_NOT_CONNECTED,
             "no such connection"
         );
@@ -380,6 +387,8 @@ fn a_whole_conversation_through_the_c_functions() {
             assert_eq!(vn_server_send(srv, conn, ch, m.as_ptr(), m.len()), VN_OK);
             assert_eq!(vn_client_send(cli, ch, m.as_ptr(), m.len()), VN_OK);
         }
+        assert_eq!(vn_server_flush(srv, conn), VN_OK);
+        assert_eq!(vn_client_flush(cli), VN_OK);
         assert_eq!(
             vn_server_send(srv, conn, 3, [0u8].as_ptr(), 1),
             VN_ERR_NO_CHANNEL
@@ -431,6 +440,11 @@ fn a_whole_conversation_through_the_c_functions() {
             VN_ERR_NOT_CONNECTED,
             "stale handle"
         );
+        assert_eq!(
+            vn_server_flush(srv, conn),
+            VN_ERR_NOT_CONNECTED,
+            "stale handle"
+        );
     }
 }
 
@@ -455,6 +469,7 @@ fn a_lossy_conversation_still_delivers_everything_reliable() {
             if sent < 60 && vn_server_send(srv, conn, 0, [sent].as_ptr(), 1) == VN_OK {
                 sent += 1;
             }
+            assert_eq!(vn_server_flush(srv, conn), VN_OK);
             n.run_for(50_000);
             while vn_client_poll_recv(cli, buf.as_mut_ptr(), buf.len(), &mut ch, &mut len) == 1 {
                 got.push(buf[0]);

@@ -28,6 +28,7 @@ pub const raw = struct {
     pub extern fn vn_server_poll_transmit(s: *anyopaque, buf: [*]u8, cap: usize, to: *Addr, now_us: u64) usize;
     pub extern fn vn_server_poll_event(s: *anyopaque, out: *EventRaw) i32;
     pub extern fn vn_server_send(s: *anyopaque, conn: Conn, ch: u8, data: [*]const u8, len: usize) i32;
+    pub extern fn vn_server_flush(s: *anyopaque, conn: Conn) i32;
     pub extern fn vn_server_poll_recv(s: *anyopaque, buf: [*]u8, cap: usize, out: *RecvRaw) i32;
     pub extern fn vn_server_disconnect(s: *anyopaque, conn: Conn, reason: u8) i32;
     pub extern fn vn_server_conn_stats(s: *const anyopaque, conn: Conn, out: *ConnStats) i32;
@@ -45,6 +46,7 @@ pub const raw = struct {
     pub extern fn vn_client_next_deadline(c: *const anyopaque) u64;
     pub extern fn vn_client_poll_event(c: *anyopaque, out: *ClientEventRaw) i32;
     pub extern fn vn_client_send(c: *anyopaque, ch: u8, data: [*]const u8, len: usize) i32;
+    pub extern fn vn_client_flush(c: *anyopaque) i32;
     pub extern fn vn_client_poll_recv(c: *anyopaque, buf: [*]u8, cap: usize, ch: *u8, len: *u32) i32;
     pub extern fn vn_client_disconnect(c: *anyopaque, reason: u8) void;
     pub extern fn vn_client_is_connected(c: *const anyopaque) i32;
@@ -379,8 +381,15 @@ pub const Server = struct {
         };
     }
 
+    /// Queue a message. Nothing leaves until `flush` or a timer starts a datagram.
     pub fn send(self: *Server, conn: Conn, ch: u8, data: []const u8) Error!void {
         try check(raw.vn_server_send(self.ptr, conn, ch, data.ptr, data.len));
+    }
+
+    /// Send what is queued for `conn` now (the next `pollTransmit` calls return the datagrams).
+    /// Does nothing if nothing is queued.
+    pub fn flush(self: *Server, conn: Conn) Error!void {
+        try check(raw.vn_server_flush(self.ptr, conn));
     }
 
     /// The next received message, bytes written into `buf` (at least 1200).
@@ -473,8 +482,14 @@ pub const Client = struct {
         };
     }
 
+    /// Queue a message; see `Server.send`.
     pub fn send(self: *Client, ch: u8, data: []const u8) Error!void {
         try check(raw.vn_client_send(self.ptr, ch, data.ptr, data.len));
+    }
+
+    /// Send what is queued now; see `Server.flush`.
+    pub fn flush(self: *Client) Error!void {
+        try check(raw.vn_client_flush(self.ptr));
     }
 
     pub fn pollRecv(self: *Client, buf: []u8) ?struct { ch: u8, len: usize } {

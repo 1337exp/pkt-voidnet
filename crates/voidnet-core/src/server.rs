@@ -761,6 +761,19 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
             .send(ch, data)
     }
 
+    /// Send what is queued for a connection now: the next [`poll_transmit`](Self::poll_transmit)
+    /// calls produce the datagram(s). Nothing is sent without this (or a timer): `send` only
+    /// queues. Does nothing if nothing is queued. See `docs/transmit.md`.
+    /// Отправить то, что поставлено в очередь соединения: ближайшие `poll_transmit` отдадут
+    /// датаграммы. Без этого (или таймера) ничего не уходит: `send` только ставит в очередь.
+    pub fn flush(&mut self, conn: ConnId) -> Result<(), SendError> {
+        self.slot_mut(conn)
+            .ok_or(SendError::NotConnected)?
+            .conn
+            .flush();
+        Ok(())
+    }
+
     /// The next received message from any connection, written into `buf` (at least
     /// [`MSG_MAX`] bytes). Connections are served in turn. `None` when nothing is waiting.
     /// Следующее принятое сообщение от любого соединения; соединения обслуживаются по кругу.

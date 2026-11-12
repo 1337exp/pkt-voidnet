@@ -163,7 +163,7 @@ typedef struct vn_client vn_client;
 
 /* ---- general -------------------------------------------------------------------------- */
 
-uint32_t vn_abi_version(void); /* (major << 16) | minor */
+uint32_t vn_abi_version(void); /* (major << 16) | minor; 2: send no longer sends, see vn_*_flush */
 uint32_t vn_wire_version(void);
 int32_t vn_abi_info(vn_abi_info* out);
 
@@ -187,7 +187,12 @@ uint64_t vn_server_next_deadline(const vn_server* s); /* UINT64_MAX: never */
 size_t vn_server_poll_transmit(vn_server* s, uint8_t* buf, size_t cap, vn_addr* to, uint64_t now_us);
 /* 1: event written, 0: none. */
 int32_t vn_server_poll_event(vn_server* s, vn_event* out);
+/* Queues a message; nothing leaves until vn_server_flush or a timer (ack delay, retransmit,
+ * keep-alive) starts a datagram. A queued message rides with the next datagram. */
 int32_t vn_server_send(vn_server* s, vn_conn conn, uint8_t ch, const uint8_t* data, size_t len);
+/* Send what is queued for conn now: the following vn_server_poll_transmit calls return the
+ * datagram(s). Does nothing when nothing is queued; never makes an ack-only datagram. */
+int32_t vn_server_flush(vn_server* s, vn_conn conn);
 /* 1: message received (bytes in buf, details in *out), 0: none. cap >= msg_max. */
 int32_t vn_server_poll_recv(vn_server* s, uint8_t* buf, size_t cap, vn_recv* out);
 int32_t vn_server_disconnect(vn_server* s, vn_conn conn, uint8_t reason);
@@ -210,7 +215,9 @@ void vn_client_handle_datagram(vn_client* c, const vn_addr* from, const uint8_t*
 size_t vn_client_poll_transmit(vn_client* c, uint8_t* buf, size_t cap, vn_addr* to, uint64_t now_us);
 uint64_t vn_client_next_deadline(const vn_client* c);
 int32_t vn_client_poll_event(vn_client* c, vn_client_event* out);
+/* Same model as vn_server_send / vn_server_flush. */
 int32_t vn_client_send(vn_client* c, uint8_t ch, const uint8_t* data, size_t len);
+int32_t vn_client_flush(vn_client* c);
 int32_t vn_client_poll_recv(vn_client* c, uint8_t* buf, size_t cap, uint8_t* ch, uint32_t* len);
 void vn_client_disconnect(vn_client* c, uint8_t reason);
 int32_t vn_client_is_connected(const vn_client* c);

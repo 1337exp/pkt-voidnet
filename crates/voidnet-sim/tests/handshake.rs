@@ -493,6 +493,10 @@ fn silence_ends_a_connection_on_both_sides() {
     let mut w = Small::new(cfg, 7);
     w.add_client(ip(1, 1, 5000), ccfg, clean());
     assert!(w.run_until(2_000_000, |w| w.connected_events() == 1));
+    // the client hears from the server (the acknowledgement of its first datagram) within one
+    // `max_ack_delay`; only after that does silence count as a lost connection rather than a
+    // connection that never came up
+    w.run_for(200_000);
     // the path goes dark
     w.peers[0].up.params_mut().loss_permille = 1000;
     w.peers[0].down.params_mut().loss_permille = 1000;
@@ -706,7 +710,7 @@ fn a_whole_scenario_is_reproducible_from_its_seed() {
     // golden: if this changes, behaviour changed (and it must be the same on every OS)
     let (hash, connected, _) = run(5);
     assert_eq!(connected, 5);
-    assert_eq!(hash, 0x6e5e_a2b6_3d29_b859, "golden trace: {hash:#018x}");
+    assert_eq!(hash, 0x0362_4634_1f6e_58e7, "golden trace: {hash:#018x}");
 }
 
 // ------------------------------------------------------------------ gaps found by mutation testing

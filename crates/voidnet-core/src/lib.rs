@@ -47,4 +47,4 @@ pub use wire::{
 
 /// ABI/protocol generation of this build, `(major << 16) | minor`.
 /// Поколение ABI/протокола этой сборки, `(major << 16) | minor`.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;

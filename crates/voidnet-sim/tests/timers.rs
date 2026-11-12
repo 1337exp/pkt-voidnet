@@ -51,6 +51,7 @@ fn three_newer_acknowledged_packets_make_an_older_one_lost_at_once() {
     let t = 1_000_000;
     for i in 0..4u8 {
         c.send(0, &[i]).unwrap();
+        c.flush();
         assert!(c.build(t, &mut buf).is_some(), "datagram {i}");
     }
     assert_eq!(c.stats().packets_sent, 4);
@@ -82,6 +83,7 @@ fn two_newer_acknowledged_packets_are_not_enough_yet() {
     let t = 1_000_000;
     for i in 0..3u8 {
         c.send(0, &[i]).unwrap();
+        c.flush();
         c.build(t, &mut buf).unwrap();
     }
     feed(&mut c, &cfg, &ack_datagram(&cfg, 0, &[1, 2]), t + 1);
@@ -95,8 +97,10 @@ fn an_old_unacknowledged_packet_is_lost_by_time_once_a_later_one_is_acknowledged
     let mut buf = [0u8; 1400];
     let t = 1_000_000;
     c.send(0, &[0]).unwrap();
+    c.flush();
     c.build(t, &mut buf).unwrap(); // packet 0
     c.send(0, &[1]).unwrap();
+    c.flush();
     c.build(t + 400_000, &mut buf).unwrap(); // packet 1, much later
                                              // only packet 1 is acknowledged; packet 0 is 400 ms older than that, longer than 9/8 of
                                              // the assumed 100 ms round trip, and only ONE packet overtook it
@@ -117,11 +121,13 @@ fn a_lone_lost_message_is_probed_after_about_one_pto_not_after_the_keepalive() {
     );
     for _ in 0..10 {
         p.a.conn.send(1, b"warm up").unwrap();
+        p.a.conn.flush();
         p.run_for(100_000);
         while p.b.conn.poll_recv().is_some() {}
     }
     p.ab.params_mut().loss_permille = 1000;
     p.a.conn.send(0, b"x").unwrap();
+    p.a.conn.flush();
     p.run_for(3_000);
     p.ab.params_mut().loss_permille = 0;
     let t0 = p.now;
@@ -141,6 +147,7 @@ fn the_probe_timer_backs_off_even_if_the_host_calls_on_timeout_all_the_time() {
     let cfg = cfg();
     let mut c = Conn::new(TOKEN, cfg, 0);
     c.send(0, b"nobody answers").unwrap();
+    c.flush();
     let mut buf = [0u8; 1400];
     let mut now = 1_000_000;
     let mut sent = 0;
@@ -166,6 +173,7 @@ fn a_sender_never_runs_far_ahead_of_what_the_peer_has_confirmed() {
     for _ in 0..30_000u32 {
         now += 1_000;
         c.send(1, b"state").unwrap();
+        c.flush();
         while c.build(now, &mut buf).is_some() {}
     }
     let sent = c.stats().packets_sent;
@@ -213,6 +221,7 @@ fn an_acknowledgement_resets_the_probe_backoff() {
     );
     for _ in 0..10 {
         p.a.conn.send(1, b"warm up").unwrap();
+        p.a.conn.flush();
         p.run_for(100_000);
         while p.b.conn.poll_recv().is_some() {}
     }
@@ -220,6 +229,7 @@ fn an_acknowledgement_resets_the_probe_backoff() {
     p.ab.params_mut().loss_permille = 1000;
     p.ba.params_mut().loss_permille = 1000;
     p.a.conn.send(0, b"during the outage").unwrap();
+    p.a.conn.flush();
     p.run_for(6_000_000);
     p.ab.params_mut().loss_permille = 0;
     p.ba.params_mut().loss_permille = 0;
@@ -228,6 +238,7 @@ fn an_acknowledgement_resets_the_probe_backoff() {
     // life returns to normal for a while
     for _ in 0..30 {
         p.a.conn.send(1, b"normal").unwrap();
+        p.a.conn.flush();
         p.run_for(100_000);
         while p.b.conn.poll_recv().is_some() {}
     }
@@ -235,6 +246,7 @@ fn an_acknowledgement_resets_the_probe_backoff() {
     // by the memory of the outage
     p.ab.params_mut().loss_permille = 1000;
     p.a.conn.send(0, b"again").unwrap();
+    p.a.conn.flush();
     p.run_for(3_000);
     p.ab.params_mut().loss_permille = 0;
     let t0 = p.now;

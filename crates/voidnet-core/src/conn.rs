@@ -274,11 +274,13 @@ pub struct Conn {
     last_send_us: u64,
     largest_recv_us: u64,
 
-    // acknowledgements owed to the peer
+    // acknowledgements owed to the peer: they ride on the next datagram, or leave alone once
+    // `max_ack_delay_us` has passed since `ack_since_us`
     ack_owed: bool,
-    ack_now: bool,
     ack_since_us: u64,
-    eliciting_unacked: u8,
+
+    /// The host asked to send what is queued now. Cleared when nothing is queued any more.
+    flush_pending: bool,
 
     // what the peer acknowledged of ours
     sent: [Sent; SENT_CAP],
@@ -333,9 +335,8 @@ impl Conn {
             last_send_us: now_us,
             largest_recv_us: now_us,
             ack_owed: false,
-            ack_now: false,
             ack_since_us: 0,
-            eliciting_unacked: 0,
+            flush_pending: false,
             sent: [Sent::empty(); SENT_CAP],
             sent_head: 0,
             sent_len: 0,
@@ -392,9 +393,8 @@ impl Conn {
         self.last_send_us = now_us;
         self.largest_recv_us = now_us;
         self.ack_owed = false;
-        self.ack_now = false;
         self.ack_since_us = 0;
-        self.eliciting_unacked = 0;
+        self.flush_pending = false;
         for s in &mut self.sent {
             s.state = Pkt::Acked;
             s.nrefs = 0;
@@ -482,9 +482,12 @@ impl Conn {
     // ------------------------------------------------------------------------- sending
 
     /// Queue a message. Reliable messages either fit the window completely or are refused;
-    /// unreliable ones replace the oldest waiting message when the queue is full.
+    /// unreliable ones replace the oldest waiting message when the queue is full. Nothing is sent
+    /// by this call: the message leaves with the next datagram, which [`flush`](Self::flush) or a
+    /// timer starts.
     /// Поставить сообщение в очередь. Надёжное либо входит в окно целиком, либо отклоняется;
-    /// ненадёжное при переполнении вытесняет самое старое из ожидающих.
+    /// ненадёжное при переполнении вытесняет самое старое из ожидающих. Сама эта функция ничего
+    /// не отправляет: сообщение уйдёт со следующей датаграммой, которую начнёт `flush` или таймер.
     pub fn send(&mut self, ch: u8, data: &[u8]) -> Result<(), SendError> {
         let mode = self.mode(ch).ok_or(SendError::NoChannel)?;
         if data.len() > MSG_MAX {
@@ -639,12 +642,11 @@ impl Conn {
     /// Когда соединению снова нужны `on_timeout` или отправка.
     pub fn next_deadline(&self) -> Option<u64> {
         let mut t = u64::MAX;
+        if self.flush_pending && self.has_queued() || self.has_retransmit() {
+            t = 0;
+        }
         if self.ack_owed {
-            t = t.min(if self.ack_now {
-                0
-            } else {
-                self.ack_since_us.saturating_add(self.cfg.max_ack_delay_us)
-            });
+            t = t.min(self.ack_since_us.saturating_add(self.cfg.max_ack_delay_us));
         }
         if let Some(p) = self.newest_eliciting_pending() {
             let backoff = self.pto_count.min(MAX_PTO_BACKOFF);
@@ -772,6 +774,7 @@ impl Conn {
         }
         self.detect_loss(now_us);
         self.pop_resolved();
+        self.settle_flush();
     }
 
     // ------------------------------------------------------------------------- receiving
@@ -831,15 +834,11 @@ impl Conn {
                 Frame::Disconnect { reason } => out.disconnect = Some(reason),
             }
         }
-        if out.ack_eliciting {
-            if !self.ack_owed {
-                self.ack_owed = true;
-                self.ack_since_us = now_us;
-            }
-            self.eliciting_unacked = self.eliciting_unacked.saturating_add(1);
-            if out.ping || self.eliciting_unacked >= 2 {
-                self.ack_now = true;
-            }
+        // The acknowledgement waits for a datagram to ride on; the clock starts with the oldest
+        // packet that is not acknowledged yet.
+        if out.ack_eliciting && !self.ack_owed {
+            self.ack_owed = true;
+            self.ack_since_us = now_us;
         }
         self.drain_reorder();
         Ok(out)
@@ -964,18 +963,56 @@ impl Conn {
             .any(|tx| tx.slots.iter().any(|s| s.state == Slot::Queued))
     }
 
+    /// A reliable message that was sent before and is waiting to go again (its packet was lost).
+    /// Надёжное сообщение, которое уже уходило и ждёт повтора (его пакет потерян).
+    fn has_retransmit(&self) -> bool {
+        self.rel_tx
+            .iter()
+            .any(|tx| tx.slots.iter().any(|s| s.state == Slot::Queued && s.sent_once))
+    }
+
+    /// Anything waiting for a datagram. / Есть ли что-то, ждущее датаграммы.
+    fn has_queued(&self) -> bool {
+        self.has_queued_reliable() || !self.uq.is_empty()
+    }
+
+    /// A flush covers what is queued; once nothing is, it is spent. Without this a flush left
+    /// over after the queue emptied (a repeat acknowledged in the meantime) would send the next
+    /// message the host queues without being asked.
+    /// Flush относится к тому, что в очереди; когда очередь пуста, он исчерпан.
+    fn settle_flush(&mut self) {
+        if !self.has_queued() {
+            self.flush_pending = false;
+        }
+    }
+
+    /// Send what is queued now: the next [`build`](Self::build) produces a datagram for it.
+    /// Does nothing when nothing is queued (it never makes an acknowledgement-only datagram).
+    /// Отправить то, что в очереди: ближайший `build` соберёт для этого датаграмму. Если очередь
+    /// пуста, не делает ничего (датаграмму из одного подтверждения он не порождает).
+    pub fn flush(&mut self) {
+        self.flush_pending = self.has_queued();
+    }
+
+    fn ack_due(&self, now_us: u64) -> bool {
+        self.ack_owed && now_us >= self.ack_since_us.saturating_add(self.cfg.max_ack_delay_us)
+    }
+
     fn ping_due(&self, now_us: u64) -> bool {
         self.cfg.keepalive_us > 0
             && now_us.saturating_sub(self.last_send_us) >= self.cfg.keepalive_us
     }
 
-    /// Whether [`build`](Self::build) has something to send now. / Есть ли что отправлять.
+    /// Whether [`build`](Self::build) starts a datagram now: a flush with something queued, an
+    /// acknowledgement that has waited `max_ack_delay`, a message to repeat, a probe, a PING.
+    /// Messages queued without a flush do not count; they ride with such a datagram.
+    /// Начнёт ли `build` датаграмму сейчас: flush при непустой очереди, подтверждение,
+    /// прождавшее `max_ack_delay`, повтор, проба, PING. Сообщения без flush не в счёт: они едут
+    /// с такой датаграммой.
     pub fn wants_to_send(&self, now_us: u64) -> bool {
-        (self.ack_owed
-            && (self.ack_now
-                || now_us >= self.ack_since_us.saturating_add(self.cfg.max_ack_delay_us)))
-            || self.has_queued_reliable()
-            || !self.uq.is_empty()
+        (self.flush_pending && self.has_queued())
+            || self.ack_due(now_us)
+            || self.has_retransmit()
             || self.probe > 0
             || self.ping_requested
             || self.ping_due(now_us)
@@ -984,6 +1021,12 @@ impl Conn {
     /// Build the next DATA datagram for this connection into `buf`, or `None`.
     /// Собрать следующую DATA этого соединения в `buf` или `None`.
     pub fn build(&mut self, now_us: u64, buf: &mut [u8]) -> Option<usize> {
+        let n = self.build_datagram(now_us, buf);
+        self.settle_flush();
+        n
+    }
+
+    fn build_datagram(&mut self, now_us: u64, buf: &mut [u8]) -> Option<usize> {
         if !self.wants_to_send(now_us) {
             return None;
         }
@@ -1073,8 +1116,6 @@ impl Conn {
         // book-keeping, only now that the datagram exists
         if acked_now {
             self.ack_owed = false;
-            self.ack_now = false;
-            self.eliciting_unacked = 0;
         }
         if self.probe > 0 && eliciting {
             self.probe -= 1;

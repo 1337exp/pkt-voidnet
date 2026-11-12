@@ -126,6 +126,8 @@ fn eight_clients_exchange_ordered_streams_both_ways_over_hostile_links() {
             {
                 to_srv[i] += 1;
             }
+            w.server.flush(conns[i]).unwrap();
+            w.peers[i].client.flush().unwrap();
             while let Some((ch, len)) = w.peers[i].client.poll_recv(&mut buf) {
                 assert_eq!(ch, RELIABLE);
                 let (from, k) = parse(&buf[..len]);
@@ -188,10 +190,12 @@ fn server_sees_the_round_trip_time_of_every_client() {
     for tick in 0..300u32 {
         for (i, c) in conns.iter().enumerate() {
             w.server.send(*c, UNRELIABLE, &msg(i as u32, tick)).unwrap();
+            w.server.flush(*c).unwrap();
             w.peers[i]
                 .client
                 .send(UNRELIABLE, &msg(i as u32, tick))
                 .unwrap();
+            w.peers[i].client.flush().unwrap();
         }
         w.run_for(20_000);
         for i in 0..4 {
@@ -248,10 +252,12 @@ fn a_peer_that_stops_answering_is_dropped_and_the_host_is_told() {
     let mut w = Big::new(cfg, 24);
     w.add_client(ip(1), ccfg, clean(20_000));
     assert!(w.run_until(3_000_000, |w| w.connected_events() == 1));
+    w.run_for(200_000); // the client hears the server's first acknowledgement
     let c = conn_of(&w, ip(1)).unwrap();
     w.peers[0].up.params_mut().loss_permille = 1000;
     w.peers[0].down.params_mut().loss_permille = 1000;
     w.server.send(c, RELIABLE, b"anyone there?").unwrap();
+    w.server.flush(c).unwrap();
     w.run_for(10_000_000);
     assert!(w.server_events.iter().any(|e| matches!(
         e,
@@ -282,6 +288,7 @@ fn the_first_server_message_is_not_slowed_down_by_confirmation() {
         if sent_at.is_none() {
             if let Some(c) = conn_of(w, ip(1)) {
                 w.server.send(c, RELIABLE, b"welcome").unwrap();
+                w.server.flush(c).unwrap();
                 sent_at = Some(w.now);
             }
         }
@@ -318,6 +325,7 @@ fn a_busy_client_does_not_starve_the_others() {
             for _ in 0..times {
                 let _ = w.server.send(*c, UNRELIABLE, &msg(i as u32, tick));
             }
+            w.server.flush(*c).unwrap();
         }
         w.run_for(20_000);
         for i in 0..8usize {
@@ -349,10 +357,12 @@ fn a_stack_of_datagram_costs_stay_game_sized() {
     for tick in 0..500u32 {
         for (i, c) in conns.iter().enumerate() {
             w.server.send(*c, UNRELIABLE, &msg(i as u32, tick)).unwrap();
+            w.server.flush(*c).unwrap();
             w.peers[i]
                 .client
                 .send(UNRELIABLE, &msg(i as u32, tick))
                 .unwrap();
+            w.peers[i].client.flush().unwrap();
         }
         w.run_for(20_000);
         for i in 0..8usize {
@@ -386,6 +396,7 @@ fn sequenced_state_is_never_older_than_what_was_already_seen() {
     let mut seen = 0;
     for tick in 0..1500u32 {
         w.server.send(c, SEQUENCED, &msg(7, tick)).unwrap();
+        w.server.flush(c).unwrap();
         w.run_for(10_000);
         while let Some((ch, len)) = w.peers[0].client.poll_recv(&mut buf) {
             let (_, k) = parse(&buf[..len]);
@@ -416,6 +427,7 @@ fn a_limited_send_budget_is_shared_fairly() {
     for tick in 0..1000u32 {
         for (i, c) in conns.iter().enumerate() {
             let _ = w.server.send(*c, UNRELIABLE, &msg(i as u32, tick));
+            w.server.flush(*c).unwrap();
         }
         w.run_for(1_000);
         for i in 0..8usize {
