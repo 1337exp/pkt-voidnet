@@ -4,7 +4,7 @@
 
 A small, self-contained network core for games: connections, delivery modes, resilience to hostile input. It knows nothing about the game built on top of it.
 
-**Status: stages 1-4a done: connections work and carry data in the simulator, and there is a C ABI with a Zig binding.** Wire format, handshake and admission, delivery (reliable ordered, unreliable, unreliable-sequenced), and now the C ABI (`include/voidnet.h`, host-owned memory, no callbacks) and `bindings/zig`. Tee has a facade on top of it (`@lib/network/vn` in the Tee repository, 13 contract tests on Zig 0.17). Not yet played in the game: that is stage 5.
+**Status: stages 1-4b done: connections work and carry data in the simulator, there is a C ABI with a Zig binding, and the core builds a datagram only on an explicit `flush` or a timer (4b).** Wire format, handshake and admission, delivery (reliable ordered, unreliable, unreliable-sequenced), and now the C ABI (`include/voidnet.h`, host-owned memory, no callbacks) and `bindings/zig`. Tee has a facade on top of it (`@lib/network/vn` in the Tee repository, 13 contract tests on Zig 0.17). Not yet played in the game: that is stage 5.
 
 ## Stack
 
@@ -28,6 +28,7 @@ Fuzz targets: `parse_datagram`, `recv_window`, `ack_frame`, `handshake_flood`, `
 
 ## How it is built
 
+- `docs/transmit.md`: when a datagram is built. `send` only queues; a datagram starts on `flush` or on a timer (ack delay, retransmit, probe, keep-alive); an acknowledgement rides on the nearest datagram and goes alone only after `max_ack_delay`. Pick `max_ack_delay` longer than the longest regular gap of your reverse flow (50 Hz down, inputs every 50 ms up: 60 ms gives 50 + 20 datagrams per second and no ack-only ones; 20 ms gives 20 extra ack-only per second).
 - `docs/wire.md`: the only normative description of the bytes. `vectors/wire-v1.txt`: byte strings with their canonical reading.
 - `crates/voidnet-core`: `no_std`, no allocation, `forbid(unsafe_code)`, indexing and `unwrap` denied by lint. Wire parser, packet number window, ACK frames, the connection (`Conn`: delivery, RTT, loss, timers), `Server` and `Client` state machines. About 100 KB per connection, fixed.
 - `crates/voidnet-sim`: seeded PRNG, lossy link (loss, duplication, reordering, blackout), a small world of one server and many clients, a pair of bare connections, golden trace hashes, attack, loss and timer scenarios.
@@ -49,7 +50,7 @@ Measured on the author's Windows machine, release build, `opt-level = "z"` (size
 | Reliable channel, 25% loss + 10% duplication + 15% reordering, 30 seeds | every message exactly once, in order |
 | Dead path | 17 probe packets in 10 seconds (backoff), recovers by itself when the path returns |
 | Lost single message with no other traffic | repaired in a fraction of a second, long before the keep-alive |
-| Tests | 114, plus 5 fuzz targets (millions of runs, no finding in the core), 30 deliberate breakages of the core all caught |
+| Tests | 137, plus 5 fuzz targets (millions of runs, no finding in the core), 30 deliberate breakages of the core all caught |
 
 Reproduce the speed measurement: `cargo test --release -p voidnet-sim --test bench -- --ignored --nocapture`.
 

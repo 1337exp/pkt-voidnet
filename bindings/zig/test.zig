@@ -234,6 +234,9 @@ test "three clients connect over a lossy network and exchange all three kinds of
             if (tick % 20 == 0) p.client.send(1, "input") catch {};
             // and a state-like one from the server
             if (tick % 20 == 0) w.server.send(conn, 2, "state") catch {};
+            // nothing leaves without a flush: one per tick for each side, as a game would do
+            p.client.flush() catch {};
+            w.server.flush(conn) catch {};
             while (p.client.pollRecv(&buf)) |m| {
                 if (m.ch == 0) {
                     const n = std.mem.readInt(u32, buf[0..4], .little);

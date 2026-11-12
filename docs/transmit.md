@@ -1,4 +1,4 @@
-# When the core sends a datagram (design note, stage 5)
+# When the core sends a datagram (design note, stage 4b)
 
 Status: implemented. Decision 4 of `tee/docs/architecture/online-architecture.md`.
 Russian version: [transmit.ru.md](transmit.ru.md). The wire format does not change.
@@ -65,7 +65,7 @@ An ack-only datagram appears whenever the reverse flow leaves a gap longer than 
 after something that needs an ack. With 50 Hz down and ~20 inputs/s up (a flush every 50 ms) and
 `max_ack_delay` = one 20 ms tick, the client still sends about as many ack-only datagrams as before.
 The delay must be longer than the longest regular gap of the reverse flow. Measurements are in the
-test `ack_only_share_by_ack_delay` of `crates/voidnet-sim/tests/gamelike.rs` and in the README.
+test `standalone_acknowledgements_are_bounded_by_the_ack_delay` and the table printed by `explore_ack_only_share` of `crates/voidnet-sim/tests/gamelike.rs` and in the README.
 The price of a longer delay: the sender learns about delivery and loss later by up to that much
 (the PTO already includes `max_ack_delay`, so there are no false probes), and RTT samples are
 corrected by the delay field of the ACK.

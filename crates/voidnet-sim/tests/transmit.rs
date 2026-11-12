@@ -1,7 +1,7 @@
-//! Stage 5: when a datagram is built (see docs/transmit.md). A datagram starts only on an explicit
+//! Stage 4b: when a datagram is built (see docs/transmit.md). A datagram starts only on an explicit
 //! `flush` or when a timer fires; an acknowledgement rides on the nearest datagram and leaves alone
 //! only after `max_ack_delay`.
-//! Этап 5: когда строится датаграмма. Только по явному `flush` или по таймеру; подтверждение
+//! Этап 4б: когда строится датаграмма. Только по явному `flush` или по таймеру; подтверждение
 //! едет с ближайшей датаграммой и уходит отдельно лишь через `max_ack_delay`.
 
 use voidnet_core::conn::{Conn, ConnConfig, REL_WINDOW};
