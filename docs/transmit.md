@@ -38,6 +38,12 @@ trigger ever comes it waits until the keep-alive datagram at the latest; hosts t
 Several datagrams may be needed for one flush (a large queue); the flush stays pending until the
 queue is empty, so a host that loops on `poll_transmit` drains it.
 
+**Latency-critical messages must be flushed.** Without `flush` a message waits for the next datagram
+of any kind, which in a tick-driven host is the next tick's flush (up to a tick later) and in an idle
+connection the keep-alive (up to `keepalive_us`). Anything whose age matters (a reply the peer
+measures time with, input, a request the user waits for) is sent with `flush`. Before this change
+`send` alone was enough, so a host that never flushed worked; it now loses that latency silently.
+
 ### What is removed
 
 - "Every second ack-eliciting packet is acknowledged at once" (`eliciting_unacked >= 2`) and the
