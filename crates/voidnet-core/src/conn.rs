@@ -966,9 +966,11 @@ impl Conn {
     /// A reliable message that was sent before and is waiting to go again (its packet was lost).
     /// Надёжное сообщение, которое уже уходило и ждёт повтора (его пакет потерян).
     fn has_retransmit(&self) -> bool {
-        self.rel_tx
-            .iter()
-            .any(|tx| tx.slots.iter().any(|s| s.state == Slot::Queued && s.sent_once))
+        self.rel_tx.iter().any(|tx| {
+            tx.slots
+                .iter()
+                .any(|s| s.state == Slot::Queued && s.sent_once)
+        })
     }
 
     /// Anything waiting for a datagram. / Есть ли что-то, ждущее датаграммы.

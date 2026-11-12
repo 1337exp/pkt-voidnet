@@ -69,7 +69,10 @@ fn run(seed: u64, loss_permille: u32, seconds: u64) -> [(u64, u64, Vec<u64>); 2]
     }
     let [sa, sb] = [p.a.conn.stats(), p.b.conn.stats()];
     let [la, lb] = per_sec;
-    [(sa.packets_sent, sa.packets_lost, la), (sb.packets_sent, sb.packets_lost, lb)]
+    [
+        (sa.packets_sent, sa.packets_lost, la),
+        (sb.packets_sent, sb.packets_lost, lb),
+    ]
 }
 
 #[test]
@@ -85,37 +88,130 @@ fn explore_loss_declared_on_a_game_like_stream() {
     }
 }
 
-/// Datagram rate and ack-only share for a two-way stream; a clean link, so loss does not hide it.
-#[test]
-#[ignore = "exploration: prints datagrams per second and the ack-only share"]
-fn explore_ack_only_share() {
-    for (name, a_period_us, b_period_us) in [
-        ("both 50 Hz", 20_000u64, 20_000u64),
-        ("client sends 20/s, server 50/s (standing)", 50_000, 20_000),
-    ] {
-        let mut p = Pair::new(cfg(), Params { latency_us: 1_000, ..Params::default() }, 3);
-        let end = p.now + 20_000_000;
-        let (mut na, mut nb) = (p.now, p.now);
-        while p.now < end {
-            if p.now >= na {
-                na += a_period_us;
-                let _ = p.a.conn.send(UNRELIABLE, &[1u8; 30]);
-                p.a.conn.flush();
-            }
-            if p.now >= nb {
-                nb += b_period_us;
-                let _ = p.b.conn.send(UNRELIABLE, &[2u8; 120]);
-                p.b.conn.flush();
-            }
-            p.step();
-            while p.a.conn.poll_recv().is_some() {}
-            while p.b.conn.poll_recv().is_some() {}
+/// The game-like flow of the tee online architecture, decision 4: 50 Hz server snapshots down
+/// (120 bytes, flushed each tick) and inputs up every `input_period_us` (30 bytes, flushed each).
+struct Flow {
+    client: voidnet_core::ConnStats,
+    server: voidnet_core::ConnStats,
+    inputs: u64,
+    snapshots: u64,
+}
+
+fn flow(max_ack_delay_us: u64, input_period_us: u64, link: Params, seconds: u64) -> Flow {
+    let c = ConnConfig {
+        max_ack_delay_us,
+        ..cfg()
+    };
+    let mut p = Pair::new(c, link, 3);
+    let end = p.now + seconds * 1_000_000;
+    let (mut na, mut nb) = (p.now, p.now);
+    let (mut inputs, mut snapshots) = (0, 0);
+    while p.now < end {
+        if p.now >= na {
+            na += input_period_us;
+            p.a.conn.send(UNRELIABLE, &[1u8; 30]).unwrap();
+            p.a.conn.flush();
+            inputs += 1;
         }
-        let (sa, sb) = (p.a.conn.stats(), p.b.conn.stats());
-        println!(
-            "{name}: a (client) sent {:.0}/s ack-only {:.0}/s | b (server) sent {:.0}/s ack-only {:.0}/s",
-            sa.packets_sent as f64 / 20.0, sa.ack_only_sent as f64 / 20.0,
-            sb.packets_sent as f64 / 20.0, sb.ack_only_sent as f64 / 20.0,
+        if p.now >= nb {
+            nb += 20_000;
+            p.b.conn.send(UNRELIABLE, &[2u8; 120]).unwrap();
+            p.b.conn.flush();
+            snapshots += 1;
+        }
+        p.step();
+        while p.a.conn.poll_recv().is_some() {}
+        while p.b.conn.poll_recv().is_some() {}
+    }
+    Flow {
+        client: p.a.conn.stats(),
+        server: p.b.conn.stats(),
+        inputs,
+        snapshots,
+    }
+}
+
+fn jittery(loss_permille: u32) -> Params {
+    Params {
+        latency_us: 30_000,
+        jitter_us: 10_000,
+        loss_permille,
+        ..Params::default()
+    }
+}
+
+/// The game profile: a delay a little longer than the slowest regular gap of the reverse flow
+/// (inputs every 50 ms), so an acknowledgement always finds a datagram to ride on.
+const GAME_ACK_DELAY_US: u64 = 60_000;
+
+#[test]
+fn a_game_like_flow_sends_one_datagram_per_flush_and_no_standalone_acknowledgements() {
+    for loss in [0, 34] {
+        let f = flow(GAME_ACK_DELAY_US, 50_000, jittery(loss), 20);
+        eprintln!(
+            "loss {loss}/1000: client {} datagrams for {} inputs, {} ack-only | server {} for {} snapshots, {} ack-only",
+            f.client.packets_sent, f.inputs, f.client.ack_only_sent,
+            f.server.packets_sent, f.snapshots, f.server.ack_only_sent,
         );
+        assert_eq!(f.client.ack_only_sent, 0, "loss {loss}");
+        assert_eq!(f.server.ack_only_sent, 0, "loss {loss}");
+        // unreliable messages: a datagram per flush and nothing else, in both directions
+        assert_eq!(f.client.packets_sent, f.inputs, "loss {loss}");
+        assert_eq!(f.server.packets_sent, f.snapshots, "loss {loss}");
+        // and the acknowledgements did arrive: RTT is measured, packets are not all "lost"
+        assert!(f.client.rtt_us > 0 && f.server.rtt_us > 0);
+        assert!(
+            f.server.packets_lost * 10 < f.snapshots,
+            "loss {loss}: {:?}",
+            f.server
+        );
+    }
+}
+
+#[test]
+fn standalone_acknowledgements_are_bounded_by_the_ack_delay() {
+    // for any input rate and delay: at most one ack-only datagram per max_ack_delay; and none at
+    // all once the delay is longer than the gaps of the flow they could ride on
+    for input_period in [20_000u64, 50_000, 100_000] {
+        for delay in [20_000u64, 40_000, 60_000, 100_000, 150_000] {
+            let f = flow(delay, input_period, jittery(0), 10);
+            for (who, s) in [("client", &f.client), ("server", &f.server)] {
+                assert!(
+                    s.ack_only_sent <= 10_000_000 / delay + 1,
+                    "{who}: {} ack-only with delay {delay}, inputs every {input_period}",
+                    s.ack_only_sent
+                );
+            }
+            // the server's acknowledgements ride on its own 20 ms tick, the client's on its inputs
+            if delay > 20_000 {
+                assert_eq!(
+                    f.server.ack_only_sent, 0,
+                    "delay {delay}, inputs every {input_period}"
+                );
+            }
+            if delay > input_period {
+                assert_eq!(
+                    f.client.ack_only_sent, 0,
+                    "delay {delay}, inputs every {input_period}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "exploration: prints the datagram table"]
+fn explore_ack_only_share() {
+    for input_period in [20_000u64, 50_000] {
+        for delay in [0u64, 20_000, 40_000, 60_000, 100_000] {
+            let f = flow(delay, input_period, jittery(0), 20);
+            let (a, b) = (f.client, f.server);
+            println!(
+                "inputs every {:2} ms, max_ack_delay {:3} ms: client sent {:3.0}/s ack-only {:3.0}/s | server sent {:3.0}/s ack-only {:3.0}/s",
+                input_period / 1000, delay / 1000,
+                a.packets_sent as f64 / 20.0, a.ack_only_sent as f64 / 20.0,
+                b.packets_sent as f64 / 20.0, b.ack_only_sent as f64 / 20.0,
+            );
+        }
     }
 }
