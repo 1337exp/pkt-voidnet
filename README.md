@@ -33,6 +33,7 @@ Fuzz targets: `parse_datagram`, `recv_window`, `ack_frame`, `handshake_flood`, `
 - `crates/voidnet-core`: `no_std`, no allocation, `forbid(unsafe_code)`, indexing and `unwrap` denied by lint. Wire parser, packet number window, ACK frames, the connection (`Conn`: delivery, RTT, loss, timers), `Server` and `Client` state machines. About 100 KB per connection, fixed.
 - `crates/voidnet-sim`: seeded PRNG, lossy link (loss, duplication, reordering, blackout), a small world of one server and many clients, a pair of bare connections, golden trace hashes, attack, loss and timer scenarios.
 - `crates/voidnet-ffi`: the C ABI (`include/voidnet.h`), `unsafe` lives only here; checked under Miri. `bindings/zig`: the Zig binding and its tests.
+- `crates/voidnet-udp`: the core on `std::net::UdpSocket` for Rust hosts (`UdpServer`, `UdpClient`): the socket, the clock, random bytes, secret rotation, timers. `pump(wait)` reads, runs timers and sends; `service()` sends what is ready right after `flush`; `try_clone_socket` + `feed` for a host that blocks on the socket in its own thread. The server is allocated zeroed on the heap and brought to life by `reset` (the only `unsafe` in the crate). Checked on loopback under Windows, including `ConnectionReset` after a send to a closed port.
 - Design and rationale: the network core specification in the Tee repository (`docs/architecture/netcore-spec.md`).
 
 ## How strong it is
@@ -50,7 +51,7 @@ Measured on the author's Windows machine, release build, `opt-level = "z"` (size
 | Reliable channel, 25% loss + 10% duplication + 15% reordering, 30 seeds | every message exactly once, in order |
 | Dead path | 17 probe packets in 10 seconds (backoff), recovers by itself when the path returns |
 | Lost single message with no other traffic | repaired in a fraction of a second, long before the keep-alive |
-| Tests | 137, plus 5 fuzz targets (millions of runs, no finding in the core), 30 deliberate breakages of the core all caught |
+| Tests | 147, plus 5 fuzz targets (millions of runs, no finding in the core), 30 deliberate breakages of the core all caught |
 
 Reproduce the speed measurement: `cargo test --release -p voidnet-sim --test bench -- --ignored --nocapture`.
 

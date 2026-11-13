@@ -1,0 +1,10 @@
+[package]
+name = "voidnet-udp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "pkt-voidnet over std UDP sockets: the socket, the clock and the timers around the sans-IO core (for Rust hosts)"
+
+[dependencies]
+voidnet-core = { path = "../voidnet-core" }

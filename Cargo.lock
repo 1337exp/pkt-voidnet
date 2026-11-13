@@ -19,3 +19,10 @@ version = "0.0.1"
 dependencies = [
  "voidnet-core",
 ]
+
+[[package]]
+name = "voidnet-udp"
+version = "0.0.1"
+dependencies = [
+ "voidnet-core",
+]

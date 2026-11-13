@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/voidnet-core", "crates/voidnet-sim", "crates/voidnet-ffi"]
+members = ["crates/voidnet-core", "crates/voidnet-sim", "crates/voidnet-ffi", "crates/voidnet-udp"]
 exclude = ["spike", "fuzz"]
 
 [workspace.package]
