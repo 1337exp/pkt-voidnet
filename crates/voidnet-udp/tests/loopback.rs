@@ -224,3 +224,18 @@ fn a_dead_server_port_does_not_break_the_client() {
     }
     assert!(failed, "the attempt must end with a timeout, not with an I/O error");
 }
+
+#[test]
+fn both_ends_start_on_a_small_stack() {
+    // A desktop shell calls `connect` from a UI thread with 1 MB of stack and many frames
+    // already on it; the state (about 100 KB per connection) must never travel by value.
+    let run = std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let (mut server, mut client) = pair();
+            connect(&mut server, &mut client);
+            client.is_connected()
+        })
+        .unwrap();
+    assert!(run.join().unwrap());
+}

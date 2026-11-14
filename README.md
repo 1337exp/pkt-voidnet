@@ -51,7 +51,7 @@ Measured on the author's Windows machine, release build, `opt-level = "z"` (size
 | Reliable channel, 25% loss + 10% duplication + 15% reordering, 30 seeds | every message exactly once, in order |
 | Dead path | 17 probe packets in 10 seconds (backoff), recovers by itself when the path returns |
 | Lost single message with no other traffic | repaired in a fraction of a second, long before the keep-alive |
-| Tests | 147, plus 5 fuzz targets (millions of runs, no finding in the core), 30 deliberate breakages of the core all caught |
+| Tests | 148, plus 5 fuzz targets (millions of runs, no finding in the core), 30 deliberate breakages of the core all caught |
 
 Reproduce the speed measurement: `cargo test --release -p voidnet-sim --test bench -- --ignored --nocapture`.
 

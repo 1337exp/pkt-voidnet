@@ -576,7 +576,8 @@ impl<const N: usize, const R: usize, const E: usize> Server<N, R, E> {
             s.addr_hash = addr_hash;
             s.client_random = h.client_random;
             s.created_us = now_us;
-            s.conn = Conn::new(token, self.cfg.conn_config(), now_us);
+            // in place: a connection is about 100 KB and must not travel through the stack
+            s.conn.reset(token, self.cfg.conn_config(), now_us);
             self.used += 1;
             self.stats.accepted += 1;
             self.reply(

@@ -175,31 +175,55 @@ pub struct UdpServer<const N: usize, const R: usize, const E: usize> {
     buf: Box<[u8; 2048]>,
 }
 
-/// The server state is large (about 100 KB per slot) and the core cannot build it in place
-/// without `unsafe`, so it is allocated zeroed on the heap and brought to life by
-/// `Server::reset`, exactly as the C ABI does with the host's memory.
-/// Состояние сервера большое (около 100 КБ на слот), поэтому оно выделяется в куче обнулённым
-/// и оживляется через `Server::reset`, как это делает C ABI с памятью хозяина.
+/// Connection state is large (about 100 KB per connection) and the core cannot build it in
+/// place without `unsafe`: `Server::new` and `Client::new` return it by value, which in a
+/// debug build copies it across several stack frames and overflows a 1 MB main thread (a
+/// desktop shell calling `connect` from its UI thread did exactly that). So both are
+/// allocated zeroed on the heap and brought to life by `reset`, exactly as the C ABI does
+/// with the host's memory.
+/// Состояние соединения большое (около 100 КБ), а `Server::new` и `Client::new` возвращают
+/// его по значению: в отладочной сборке оно копируется через несколько кадров стека и
+/// переполняет главный поток в 1 МБ. Поэтому оба выделяются в куче обнулёнными и оживляются
+/// через `reset`, как это делает C ABI с памятью хозяина.
+///
+/// # Safety
+/// `T` must be valid as all-zero bytes. Every type inside `Server` and `Client` is: that is a
+/// documented invariant of voidnet-core (`#[repr(u8)]` enums starting at 0, no `Option` or
+/// references in the state), relied on and checked under Miri by voidnet-ffi.
+unsafe fn boxed_zeroed<T>() -> Box<T> {
+    let layout = std::alloc::Layout::new::<T>();
+    assert!(layout.size() > 0);
+    // SAFETY: the layout has a non-zero size; the block is zeroed, which the caller promises
+    // is a valid `T`; `Box::from_raw` takes back exactly the block the global allocator gave
+    // for this layout.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout).cast::<T>();
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Box::from_raw(p)
+    }
+}
+
+fn invalid(e: voidnet_core::ConfigError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}"))
+}
+
 fn boxed_server<const N: usize, const R: usize, const E: usize>(
     cfg: ServerConfig,
     seed: [u8; 32],
     now_us: u64,
 ) -> io::Result<Box<Server<N, R, E>>> {
-    let layout = std::alloc::Layout::new::<Server<N, R, E>>();
-    // SAFETY: the layout has a non-zero size (a server holds its configuration), the block is
-    // zeroed, and every type inside `Server` is valid as all-zero bytes: that is a documented
-    // invariant of voidnet-core (`#[repr(u8)]` enums starting at 0, no `Option` or references
-    // in the state), relied on and checked under Miri by voidnet-ffi. `Box::from_raw` takes
-    // back exactly the block the global allocator gave for this layout.
-    let mut b = unsafe {
-        let p = std::alloc::alloc_zeroed(layout).cast::<Server<N, R, E>>();
-        if p.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        Box::from_raw(p)
-    };
-    b.reset(cfg, seed, now_us)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
+    // SAFETY: `Server` is valid as all-zero bytes, see `boxed_zeroed`
+    let mut b = unsafe { boxed_zeroed::<Server<N, R, E>>() };
+    b.reset(cfg, seed, now_us).map_err(invalid)?;
+    Ok(b)
+}
+
+fn boxed_client(cfg: ClientConfig) -> io::Result<Box<Client>> {
+    // SAFETY: `Client` is valid as all-zero bytes, see `boxed_zeroed`
+    let mut b = unsafe { boxed_zeroed::<Client>() };
+    b.reset(cfg).map_err(invalid)?;
     Ok(b)
 }
 
@@ -348,10 +372,7 @@ impl UdpClient {
             SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
         };
         let socket = UdpSocket::bind(local)?;
-        let mut core = Box::new(
-            Client::new(cfg)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?,
-        );
+        let mut core = boxed_client(cfg)?;
         let server_addr = to_addr(server);
         core.connect(server_addr, random_u64(), 0);
         let mut c = Self {

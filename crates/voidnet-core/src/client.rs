@@ -192,7 +192,8 @@ impl Client {
                 blob,
             } if echo == self.random && matches!(self.state, State::Hello | State::Responding) => {
                 self.state = State::Connected;
-                self.conn = Conn::new(token, self.cfg.conn_config(), now_us);
+                // in place: a connection is about 100 KB and must not travel through the stack
+                self.conn.reset(token, self.cfg.conn_config(), now_us);
                 self.last_tx_us = now_us;
                 let blob = Blob::new(blob).unwrap_or_default();
                 self.events.push(ClientEvent::Connected { blob, caps });
